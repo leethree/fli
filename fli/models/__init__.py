@@ -1,5 +1,6 @@
 from .airline import Airline
 from .airport import Airport
+from .city import CITY_TO_AIRPORTS, is_city_code, resolve_city
 from .google_flights import (
     BagsFilter,
     DateSearchFilters,
@@ -19,6 +20,7 @@ from .google_flights import (
 )
 
 __all__ = [
+    "CITY_TO_AIRPORTS",
     "Airline",
     "Airport",
     "BagsFilter",
@@ -36,4 +38,6 @@ __all__ = [
     "SortBy",
     "TimeRestrictions",
     "TripType",
+    "is_city_code",
+    "resolve_city",
 ]
