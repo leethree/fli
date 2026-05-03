@@ -22,7 +22,7 @@ from fli.core import (
     parse_airlines,
     parse_cabin_class,
     parse_max_stops,
-    resolve_airport,
+    resolve_origin_or_city,
 )
 from fli.core.parsers import ParseError
 from fli.models import (
@@ -64,8 +64,24 @@ def _build_selected_days(
 
 
 def dates(
-    origin: Annotated[str, typer.Argument(help="Departure airport IATA code (e.g., JFK)")],
-    destination: Annotated[str, typer.Argument(help="Arrival airport IATA code (e.g., LHR)")],
+    origin: Annotated[
+        str,
+        typer.Argument(
+            help=(
+                "Departure airport IATA code (e.g., JFK), IATA city/metro code "
+                "(e.g., LON for London), or comma-separated list (e.g., LHR,LGW)"
+            )
+        ),
+    ],
+    destination: Annotated[
+        str,
+        typer.Argument(
+            help=(
+                "Arrival airport IATA code (e.g., LHR), IATA city/metro code "
+                "(e.g., NYC for New York), or comma-separated list (e.g., JFK,EWR)"
+            )
+        ),
+    ],
     start_date: Annotated[
         str,
         typer.Option("--from", help="Start date (YYYY-MM-DD)"),
@@ -212,9 +228,12 @@ def dates(
         end_date = normalize_cli_date(end_date)
         departure_window = normalize_cli_time_range(departure_window)
 
-        # Parse parameters using shared utilities
-        origin_airport = resolve_airport(origin)
-        destination_airport = resolve_airport(destination)
+        # Parse parameters using shared utilities. Accept comma-separated
+        # codes (e.g. "LHR,LGW") or a city code ("LON") for either side.
+        origin_codes = [part.strip() for part in origin.split(",") if part.strip()]
+        destination_codes = [part.strip() for part in destination.split(",") if part.strip()]
+        origin_airports = resolve_origin_or_city(origin_codes)
+        destination_airports = resolve_origin_or_city(destination_codes)
         trip_type = TripType.ROUND_TRIP if is_round_trip else TripType.ONE_WAY
         stops = parse_max_stops(max_stops)
         seat_type = parse_cabin_class(cabin_class)
@@ -229,8 +248,8 @@ def dates(
             sunday=sunday,
         )
         query = {
-            "origin": origin_airport.name,
-            "destination": destination_airport.name,
+            "origin": ",".join(a.name for a in origin_airports),
+            "destination": ",".join(a.name for a in destination_airports),
             "start_date": start_date,
             "end_date": end_date,
             "trip_duration": trip_duration,
@@ -262,8 +281,8 @@ def dates(
 
         # Build flight segments using shared builder
         segments, trip_type = build_date_search_segments(
-            origin=origin_airport,
-            destination=destination_airport,
+            origin=origin_airports,
+            destination=destination_airports,
             start_date=start_date,
             trip_duration=trip_duration,
             is_round_trip=is_round_trip,

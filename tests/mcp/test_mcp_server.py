@@ -144,7 +144,7 @@ class TestMCPServer:
         assert isinstance(result, dict)
         assert result["success"] is False
         assert "error" in result
-        assert "Invalid airport code" in result["error"]
+        assert "Invalid airport or city code" in result["error"]
         assert result["flights"] == []
 
     def test_invalid_departure_window(self):

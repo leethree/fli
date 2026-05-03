@@ -23,6 +23,7 @@ from fli.core import (
     parse_max_stops,
     parse_sort_by,
     resolve_airport,
+    resolve_origin_or_city,
 )
 from fli.core.parsers import ParseError
 from fli.models import (
@@ -32,6 +33,15 @@ from fli.models import (
     PassengerInfo,
 )
 from fli.search import SearchFlights
+
+
+def _split_codes(value: str) -> list[str]:
+    """Split a CLI argument like ``"LHR,LGW"`` into a list of codes.
+
+    A bare value such as ``"LHR"`` or ``"LON"`` returns a single-element list,
+    which lets :func:`resolve_origin_or_city` handle metro expansion.
+    """
+    return [part.strip() for part in value.split(",") if part.strip()]
 
 
 def _search_flights_core(
@@ -76,9 +86,10 @@ def _search_flights_core(
             f"{departure_window[0]}-{departure_window[1]}" if departure_window else None
         )
 
-        # Parse parameters using shared utilities
-        origin_airport = resolve_airport(origin)
-        destination_airport = resolve_airport(destination)
+        # Parse parameters using shared utilities. Accept comma-separated
+        # codes (e.g. "LHR,LGW") or a city code ("LON") for either side.
+        origin_airports = resolve_origin_or_city(_split_codes(origin))
+        destination_airports = resolve_origin_or_city(_split_codes(destination))
         seat_type = parse_cabin_class(cabin_class)
         stops = parse_max_stops(max_stops)
         parsed_airlines = parse_airlines(airlines)
@@ -97,8 +108,8 @@ def _search_flights_core(
 
         # Create flight segments using shared builder
         segments, trip_type = build_flight_segments(
-            origin=origin_airport,
-            destination=destination_airport,
+            origin=origin_airports,
+            destination=destination_airports,
             departure_date=departure_date,
             return_date=return_date,
             time_restrictions=time_restrictions,
@@ -198,8 +209,24 @@ def _search_flights_core(
 
 
 def flights(
-    origin: Annotated[str, typer.Argument(help="Departure airport IATA code (e.g., JFK)")],
-    destination: Annotated[str, typer.Argument(help="Arrival airport IATA code (e.g., LHR)")],
+    origin: Annotated[
+        str,
+        typer.Argument(
+            help=(
+                "Departure airport IATA code (e.g., JFK), IATA city/metro code "
+                "(e.g., LON for London), or comma-separated list (e.g., LHR,LGW)"
+            )
+        ),
+    ],
+    destination: Annotated[
+        str,
+        typer.Argument(
+            help=(
+                "Arrival airport IATA code (e.g., LHR), IATA city/metro code "
+                "(e.g., NYC for New York), or comma-separated list (e.g., JFK,EWR)"
+            )
+        ),
+    ],
     departure_date: Annotated[str, typer.Argument(help="Travel date (YYYY-MM-DD)")],
     return_date: Annotated[
         str | None,

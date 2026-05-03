@@ -8,6 +8,7 @@ from enum import Enum
 from typing import TypeVar
 
 from fli.models import Airline, Airport, EmissionsFilter, MaxStops, SeatType, SortBy
+from fli.models.city import is_city_code, resolve_city
 
 T = TypeVar("T", bound=Enum)
 
@@ -58,6 +59,56 @@ def resolve_airport(code: str) -> Airport:
         return getattr(Airport, code.upper())
     except AttributeError as e:
         raise ParseError(f"Invalid airport code: '{code}'") from e
+
+
+def resolve_origin_or_city(value: str | list[str]) -> list[Airport]:
+    """Resolve an airport code, IATA city/metro code, or list of either.
+
+    Accepts a single IATA code (airport like ``"JFK"`` or metropolitan like
+    ``"LON"``) or a list mixing both forms.  Metropolitan codes are expanded
+    into their constituent airports.  When the input is a list, results are
+    deduplicated while preserving first-seen order.
+
+    Args:
+        value: A single IATA code or a list of codes.
+
+    Returns:
+        Non-empty list of resolved :class:`Airport` enum members.
+
+    Raises:
+        ParseError: If a code is neither a known city nor a valid airport,
+            or if the input list is empty.
+
+    """
+    if isinstance(value, str):
+        codes = [value]
+    else:
+        codes = [c for c in value if c and c.strip()]
+        if not codes:
+            raise ParseError("At least one airport or city code is required")
+
+    seen: set[Airport] = set()
+    resolved: list[Airport] = []
+    for raw in codes:
+        code = raw.strip().upper()
+        if not code:
+            continue
+        if is_city_code(code):
+            airports = resolve_city(code)
+        else:
+            try:
+                airports = [getattr(Airport, code)]
+            except AttributeError as e:
+                raise ParseError(f"Invalid airport or city code: '{raw}'") from e
+        for airport in airports:
+            if airport not in seen:
+                seen.add(airport)
+                resolved.append(airport)
+
+    if not resolved:
+        raise ParseError("At least one airport or city code is required")
+
+    return resolved
 
 
 def parse_airlines(codes: list[str] | None) -> list[Airline] | None:

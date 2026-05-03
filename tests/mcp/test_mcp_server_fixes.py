@@ -5,12 +5,20 @@ Covers:
   2. Round-trip price doubling (Google Flights returns combined RT price on outbound leg)
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastmcp import FastMCP
 
-from fli.mcp.server import _serialize_flight_result, mcp
+from fli.mcp.server import (
+    DateSearchParams,
+    FlightSearchParams,
+    MultiCityLeg,
+    MultiCitySearchParams,
+    _execute_flight_search,
+    _serialize_flight_result,
+    mcp,
+)
 
 # ---------------------------------------------------------------------------
 # Bug 1: list_tools — FastMCP 3.x compatibility
@@ -191,3 +199,98 @@ class TestSerializeFlightResult:
         result = _serialize_flight_result(flight, is_round_trip=False)
 
         assert result["currency"] == "EUR"
+
+
+# ---------------------------------------------------------------------------
+# City / metro code support in MCP params
+# ---------------------------------------------------------------------------
+
+
+class TestCityCodeParams:
+    """Pydantic params accept city codes and explicit airport arrays."""
+
+    def test_flight_params_accept_string_origin(self):
+        params = FlightSearchParams(origin="LON", destination="JFK", departure_date="2027-06-01")
+        assert params.origin == "LON"
+
+    def test_flight_params_accept_list_origin(self):
+        params = FlightSearchParams(
+            origin=["LHR", "LGW"], destination="JFK", departure_date="2027-06-01"
+        )
+        assert params.origin == ["LHR", "LGW"]
+
+    def test_date_params_accept_list(self):
+        params = DateSearchParams(
+            origin=["LHR", "LGW"],
+            destination="JFK",
+            start_date="2027-06-01",
+            end_date="2027-06-30",
+        )
+        assert params.origin == ["LHR", "LGW"]
+
+    def test_multi_city_leg_accepts_city_code(self):
+        leg = MultiCityLeg(origin="LON", destination="NYC", date="2027-06-01")
+        assert leg.origin == "LON"
+        assert leg.destination == "NYC"
+
+    def test_multi_city_leg_accepts_list(self):
+        leg = MultiCityLeg(origin=["LHR", "LGW"], destination=["JFK", "EWR"], date="2027-06-01")
+        assert leg.origin == ["LHR", "LGW"]
+        assert leg.destination == ["JFK", "EWR"]
+
+    def test_multi_city_params_serialize(self):
+        params = MultiCitySearchParams(
+            legs=[
+                MultiCityLeg(origin="NYC", destination="LON", date="2027-06-01"),
+                MultiCityLeg(origin="LON", destination="PAR", date="2027-06-05"),
+            ]
+        )
+        assert len(params.legs) == 2
+
+
+class TestCityResolutionFlow:
+    """City codes flow through to FlightSegment with multiple airports per slot."""
+
+    def test_city_origin_expands_to_multiple_airports(self):
+        """LON in origin should produce 6-airport departure slot."""
+        captured = {}
+
+        class _FakeSearchClient:
+            def search(self, filters):
+                captured["segments"] = filters.flight_segments
+                return []
+
+        params = FlightSearchParams(origin="LON", destination="JFK", departure_date="2027-06-01")
+        with patch("fli.mcp.server.SearchFlights", return_value=_FakeSearchClient()):
+            result = _execute_flight_search(params)
+
+        assert result["success"]
+        segments = captured["segments"]
+        assert len(segments) == 1
+        # 6 London airports as departure
+        assert len(segments[0].departure_airport) == 6
+        # Single JFK destination
+        assert len(segments[0].arrival_airport) == 1
+
+    def test_invalid_city_code_returns_parse_error(self):
+        """Unknown code in origin/destination should bubble up as a parse error."""
+        params = FlightSearchParams(origin="ZZZ", destination="JFK", departure_date="2027-06-01")
+        result = _execute_flight_search(params)
+        assert not result["success"]
+        assert "Invalid airport or city code" in result["error"]
+
+    def test_explicit_airport_array_passes_through(self):
+        captured = {}
+
+        class _FakeSearchClient:
+            def search(self, filters):
+                captured["segments"] = filters.flight_segments
+                return []
+
+        params = FlightSearchParams(
+            origin=["LHR", "LGW"], destination="JFK", departure_date="2027-06-01"
+        )
+        with patch("fli.mcp.server.SearchFlights", return_value=_FakeSearchClient()):
+            _execute_flight_search(params)
+
+        assert len(captured["segments"][0].departure_airport) == 2
