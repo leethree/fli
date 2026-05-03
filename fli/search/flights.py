@@ -76,12 +76,25 @@ class SearchFlights:
             # No raise_for_status() here: ``Client.post`` already calls it
             # internally and re-wraps any non-2xx as an Exception, so a
             # response that reaches us is always 2xx.
-            parsed = json.loads(response.text.lstrip(")]}'"))[0][2]
+
+            # Google's backend can time out and return either:
+            #   (a) an HTTP 200 with a truly empty body (or just the
+            #       anti-XSSI prefix), in which case ``json.loads('')``
+            #       would raise — guard before parsing.
+            #   (b) a parseable envelope where ``[0][2]`` is empty/None,
+            #       in which case ``parsed`` is falsy.
+            # Both are "empty body" for our purposes; both should retry on
+            # multi-leg.
+            payload = response.text.lstrip(")]}'").strip()
+            if not payload:
+                if attempt + 1 < max_attempts:
+                    continue
+                break
+            parsed = json.loads(payload)[0][2]
             if parsed:
                 decoded = json.loads(parsed)
                 break
-            # Empty body — Google's backend timed out.  For multi-leg
-            # requests we retry once; for one-way we accept the empty.
+            # Parseable envelope but empty inner payload — same retry rule.
             if attempt + 1 < max_attempts:
                 continue
 

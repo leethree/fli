@@ -256,3 +256,124 @@ class TestParsePriceInfo:
             ],
         ]
         assert SearchFlights._parse_price_info(data) == (118.0, "USD")
+
+
+class TestEmptyBodyRetry:
+    """``_do_single_search`` must handle a *truly* empty HTTP body without
+    raising — both the anti-XSSI-prefix-only case and the all-whitespace
+    case — and the multi-leg retry path must actually fire on those bodies
+    (not be bypassed by ``json.loads('')`` raising first).
+
+    Regression test for the CodeRabbit review on leethree/fli#2.
+    """
+
+    @staticmethod
+    def _multi_leg_filters() -> FlightSearchFilters:
+        today = datetime.now()
+        d1 = (today + timedelta(days=30)).strftime("%Y-%m-%d")
+        d2 = (today + timedelta(days=37)).strftime("%Y-%m-%d")
+        return FlightSearchFilters(
+            trip_type=TripType.ROUND_TRIP,
+            passenger_info=PassengerInfo(adults=1),
+            flight_segments=[
+                FlightSegment(
+                    departure_airport=[[Airport.JFK, 0]],
+                    arrival_airport=[[Airport.LHR, 0]],
+                    travel_date=d1,
+                ),
+                FlightSegment(
+                    departure_airport=[[Airport.LHR, 0]],
+                    arrival_airport=[[Airport.JFK, 0]],
+                    travel_date=d2,
+                ),
+            ],
+        )
+
+    @staticmethod
+    def _one_way_filters() -> FlightSearchFilters:
+        today = datetime.now()
+        d = (today + timedelta(days=30)).strftime("%Y-%m-%d")
+        return FlightSearchFilters(
+            trip_type=TripType.ONE_WAY,
+            passenger_info=PassengerInfo(adults=1),
+            flight_segments=[
+                FlightSegment(
+                    departure_airport=[[Airport.JFK, 0]],
+                    arrival_airport=[[Airport.LHR, 0]],
+                    travel_date=d,
+                ),
+            ],
+        )
+
+    def _make_response(self, text: str):
+        from unittest.mock import MagicMock
+
+        resp = MagicMock()
+        resp.text = text
+        return resp
+
+    def test_truly_empty_body_does_not_raise_on_multi_leg(self):
+        """An HTTP 200 with empty body must NOT raise JSONDecodeError;
+        the retry must fire and ultimately return None on persistent empty.
+        """
+        from unittest.mock import patch
+
+        sf = SearchFlights()
+        empty_response = self._make_response("")
+        with patch.object(sf.client, "post", return_value=empty_response) as mock_post:
+            result = sf._do_single_search(self._multi_leg_filters())
+
+        assert result is None
+        # Multi-leg = 1 + 1 retry attempt = 2 calls total.  If the parse
+        # raised before the retry guard, we'd see 1 call and an exception.
+        assert mock_post.call_count == 2
+
+    def test_anti_xssi_prefix_only_body_does_not_raise(self):
+        """The legacy anti-XSSI prefix on its own is still 'empty'."""
+        from unittest.mock import patch
+
+        sf = SearchFlights()
+        prefix_only = self._make_response(")]}'")
+        with patch.object(sf.client, "post", return_value=prefix_only) as mock_post:
+            result = sf._do_single_search(self._multi_leg_filters())
+
+        assert result is None
+        assert mock_post.call_count == 2
+
+    def test_one_way_does_not_retry_on_empty_body(self):
+        """One-way queries are reliable enough that retry-on-empty just
+        slows down legitimate "no flights" results — single attempt only.
+        """
+        from unittest.mock import patch
+
+        sf = SearchFlights()
+        empty_response = self._make_response("")
+        with patch.object(sf.client, "post", return_value=empty_response) as mock_post:
+            result = sf._do_single_search(self._one_way_filters())
+
+        assert result is None
+        assert mock_post.call_count == 1
+
+    def test_retry_recovers_when_second_attempt_returns_data(self):
+        """If the first body is empty but the retry succeeds, the parsed
+        flights must be returned (the retry isn't decorative)."""
+        from unittest.mock import patch
+
+        # Minimal valid envelope.  Outer JSON is a list whose ``[0][2]``
+        # is itself a JSON-encoded string; that string decodes to a list
+        # where indices 2 and 3 are ``None`` so the ``isinstance(...,
+        # list)`` filter in ``_do_single_search`` skips them and we get
+        # an empty flights list rather than an IndexError.
+        warm_payload = (
+            ")]}'\n"
+            + '[[null, null, "[null, null, null, null]"]]'
+        )
+        sf = SearchFlights()
+        responses = [self._make_response(""), self._make_response(warm_payload)]
+        with patch.object(sf.client, "post", side_effect=responses) as mock_post:
+            result = sf._do_single_search(self._multi_leg_filters())
+
+        # Empty inner list slots → zero flights, but non-None means we
+        # actually parsed the warm response and didn't bail early.
+        assert result == []
+        assert mock_post.call_count == 2
