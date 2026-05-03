@@ -5,6 +5,7 @@ functionality, enabling AI assistants to search for flights and find cheapest
 travel dates.
 """
 
+import hashlib
 import json
 import os
 from copy import deepcopy
@@ -551,10 +552,50 @@ def _canonical_endpoint(value: str | list[str]) -> str:
 
 
 def _session_key(legs: list[MultiCityLeg]) -> str:
+    """Routes-and-dates portion of the session cache key.
+
+    Public-ish helper: stable across equivalent endpoint forms (metro
+    code vs. expanded list, whitespace, case) so callers can use it for
+    canonicalization checks.  Note that the actual cache key used by
+    ``_execute_multi_city_step`` also folds in filter params — see
+    ``_session_cache_key``.
+    """
     return "|".join(
         f"{_canonical_endpoint(leg.origin)}-{_canonical_endpoint(leg.destination)}-{leg.date}"
         for leg in legs
     )
+
+
+def _session_cache_key(params: MultiCitySearchParams) -> str:
+    """Full cache key for a multi-city session — legs *and* filter params.
+
+    Without folding the filters in, a continuation call that reformulated
+    any of cabin_class / max_stops / sort_by / airlines / departure_window
+    / exclude_basic_economy / emissions / checked_bags / carry_on /
+    show_all_results / passengers would silently hit the cached session
+    keyed only on routes+dates and execute with the *original* filters,
+    with no error or warning.  By including a stable hash of the filter
+    fields, a reformulated call misses the cache and starts a fresh
+    session instead — agent-visible behaviour matches the agent's intent.
+    """
+    legs_part = _session_key(params.legs)
+    filter_fields = (
+        params.cabin_class,
+        params.max_stops,
+        params.sort_by,
+        tuple(sorted(params.airlines)) if params.airlines else None,
+        params.departure_window,
+        params.exclude_basic_economy,
+        params.emissions,
+        params.checked_bags,
+        params.carry_on,
+        params.show_all_results,
+        params.passengers,
+    )
+    # blake2b with a short digest is plenty for collision-avoidance in an
+    # in-memory dict; we're not using this for security.
+    digest = hashlib.blake2b(repr(filter_fields).encode(), digest_size=8).hexdigest()
+    return f"{legs_part}|{digest}"
 
 
 def _build_per_leg_fallback_filters(
@@ -600,7 +641,7 @@ def _execute_multi_city_step(
     key: str | None = None
 
     try:
-        key = _session_key(params.legs)
+        key = _session_cache_key(params)
         cached = _search_sessions.get(key)
 
         if cached is None or selection is None:
@@ -660,6 +701,10 @@ def _execute_multi_city_step(
             if selection < 0 or selection >= len(last_results):
                 return {
                     "success": False,
+                    # Match the rest of this handler's contract: every other
+                    # error return now carries error_kind so callers can
+                    # branch without string-matching the message.
+                    "error_kind": "validation",
                     "error": (
                         f"Selection index {selection} out of range"
                         f" (valid: 0-{len(last_results) - 1})"
@@ -1034,8 +1079,14 @@ def _search_dates_from_params(params: DateSearchParams) -> dict[str, Any]:
 @mcp.tool(
     annotations={
         "title": "Search Multi-City Flights",
-        "readOnlyHint": True,
-        "idempotentHint": True,
+        # search_multi_city is *stateful*: every successful continuation
+        # call mutates the in-memory ``_search_sessions`` cache to advance
+        # the leg pointer.  Marking it readOnly would mislead MCP clients
+        # into caching or auto-invoking it without confirmation; marking
+        # it idempotent would let a transport-layer retry advance the
+        # session past the leg the agent intended to select.
+        "readOnlyHint": False,
+        "idempotentHint": False,
     },
 )
 def search_multi_city(

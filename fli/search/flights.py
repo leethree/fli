@@ -73,7 +73,9 @@ class SearchFlights:
                 impersonate="chrome",
                 allow_redirects=True,
             )
-            response.raise_for_status()
+            # No raise_for_status() here: ``Client.post`` already calls it
+            # internally and re-wraps any non-2xx as an Exception, so a
+            # response that reaches us is always 2xx.
             parsed = json.loads(response.text.lstrip(")]}'"))[0][2]
             if parsed:
                 decoded = json.loads(parsed)
@@ -134,7 +136,8 @@ class SearchFlights:
                 impersonate="chrome",
                 allow_redirects=True,
             )
-            response.raise_for_status()
+            # No raise_for_status() here: ``Client.post`` already calls it
+            # internally and re-wraps any non-2xx as an Exception.
 
             parsed = json.loads(response.text.lstrip(")]}'"))[0][2]
             if not parsed:

@@ -641,10 +641,11 @@ class TestNegativeSelection:
                 MultiCityLeg(origin="LHR", destination="CDG", date="2027-06-05"),
             ]
         )
-        # Match the canonical key the handler will compute.
-        from fli.mcp.server import _session_key
+        # Match the full cache key the handler will compute (legs + filter
+        # params, not just legs — see _session_cache_key for the rationale).
+        from fli.mcp.server import _session_cache_key
 
-        key = _session_key(params.legs)
+        key = _session_cache_key(params)
         # Session value is a 3-tuple ``(filters, last_results, degraded)``;
         # the autouse ``_clear_multi_city_sessions`` fixture handles cleanup.
         _search_sessions[key] = (
@@ -655,4 +656,110 @@ class TestNegativeSelection:
 
         result = _execute_multi_city_step(params, selection=-1)
         assert result["success"] is False
+        assert result["error_kind"] == "validation"
         assert "out of range" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: addresses comments on punitarani/fli#145 (closed) /
+# leethree/fli#2 (active).
+# ---------------------------------------------------------------------------
+
+
+class TestSessionKeyIncludesFilters:
+    """Reformulating filter params must miss the cache, not silently re-use
+    a session computed under different filters."""
+
+    def _params(self, **overrides):
+        base = dict(
+            legs=[
+                MultiCityLeg(origin="JFK", destination="LHR", date="2027-06-01"),
+                MultiCityLeg(origin="LHR", destination="CDG", date="2027-06-05"),
+            ],
+        )
+        base.update(overrides)
+        return MultiCitySearchParams(**base)
+
+    def test_same_filters_produce_same_cache_key(self):
+        from fli.mcp.server import _session_cache_key
+
+        a = _session_cache_key(self._params(sort_by="CHEAPEST"))
+        b = _session_cache_key(self._params(sort_by="CHEAPEST"))
+        assert a == b
+
+    def test_changing_sort_by_misses_cache(self):
+        from fli.mcp.server import _session_cache_key
+
+        cheapest = _session_cache_key(self._params(sort_by="CHEAPEST"))
+        duration = _session_cache_key(self._params(sort_by="DURATION"))
+        assert cheapest != duration
+
+    def test_changing_max_stops_misses_cache(self):
+        from fli.mcp.server import _session_cache_key
+
+        any_stops = _session_cache_key(self._params(max_stops="ANY"))
+        non_stop = _session_cache_key(self._params(max_stops="NON_STOP"))
+        assert any_stops != non_stop
+
+    def test_changing_cabin_class_misses_cache(self):
+        from fli.mcp.server import _session_cache_key
+
+        eco = _session_cache_key(self._params(cabin_class="ECONOMY"))
+        biz = _session_cache_key(self._params(cabin_class="BUSINESS"))
+        assert eco != biz
+
+    def test_changing_airlines_misses_cache(self):
+        from fli.mcp.server import _session_cache_key
+
+        none_airlines = _session_cache_key(self._params(airlines=None))
+        ba_airlines = _session_cache_key(self._params(airlines=["BA"]))
+        ba_aa_airlines = _session_cache_key(self._params(airlines=["BA", "AA"]))
+        assert none_airlines != ba_airlines != ba_aa_airlines
+
+    def test_airline_order_does_not_matter(self):
+        """Caller passing ['BA','AA'] should hit the same session as ['AA','BA']."""
+        from fli.mcp.server import _session_cache_key
+
+        a = _session_cache_key(self._params(airlines=["BA", "AA"]))
+        b = _session_cache_key(self._params(airlines=["AA", "BA"]))
+        assert a == b
+
+    def test_legs_changing_misses_cache(self):
+        """Sanity: the legs-portion of the key still discriminates routes."""
+        from fli.mcp.server import _session_cache_key
+
+        jfk = _session_cache_key(self._params())
+        params_other = MultiCitySearchParams(
+            legs=[
+                MultiCityLeg(origin="EWR", destination="LHR", date="2027-06-01"),
+                MultiCityLeg(origin="LHR", destination="CDG", date="2027-06-05"),
+            ],
+        )
+        ewr = _session_cache_key(params_other)
+        assert jfk != ewr
+
+
+class TestMultiCityToolAnnotations:
+    """search_multi_city is stateful; readOnly/idempotent hints must be False."""
+
+    @pytest.mark.asyncio
+    async def test_search_multi_city_is_not_marked_readonly_or_idempotent(self):
+        tools = await mcp.list_tools()
+        tool = next(t for t in tools if t.name == "search_multi_city")
+        # ``False`` is the explicit signal to MCP clients that this tool
+        # mutates server state (``_search_sessions``) and that retried
+        # invocations are not safe — skipping a leg by silently advancing
+        # the session pointer would be a real footgun.
+        assert tool.annotations.readOnlyHint is False
+        assert tool.annotations.idempotentHint is False
+
+    @pytest.mark.asyncio
+    async def test_search_flights_remains_readonly_and_idempotent(self):
+        """Sanity check that we didn't over-correct the read-only tools."""
+        tools = await mcp.list_tools()
+        sf = next(t for t in tools if t.name == "search_flights")
+        sd = next(t for t in tools if t.name == "search_dates")
+        assert sf.annotations.readOnlyHint is True
+        assert sf.annotations.idempotentHint is True
+        assert sd.annotations.readOnlyHint is True
+        assert sd.annotations.idempotentHint is True
