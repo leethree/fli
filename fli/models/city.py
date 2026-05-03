@@ -13,8 +13,10 @@ When a code exists in both this map and the :class:`Airport` enum (e.g.
 ``SHA`` denotes both the Shanghai metropolitan area and Shanghai Hongqiao
 airport specifically, ``SAO`` denotes São Paulo metro and Campo de Marte),
 the city expansion takes precedence so that searches match Google Flights'
-default behavior.  To target a specific airport instead of the metro, pass
-the airport code in a list (e.g. ``["SHA"]``).
+default behavior.  Code collisions are kept intentionally narrow — only
+``SHA`` and ``SAO`` here — and Campo de Marte (``SAO``) is a small domestic
+airport with no commercial international flights, so the override is safe
+in practice.
 """
 
 from .airport import Airport

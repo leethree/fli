@@ -450,15 +450,20 @@ _search_sessions: dict[str, tuple[Any, list[Any]]] = {}
 
 
 def _format_endpoint(value: str | list[str]) -> str:
-    """Format an origin/destination value (string or list) for display/keys."""
+    """Format an origin/destination value (string or list) for display."""
     if isinstance(value, list):
         return "/".join(v.upper() for v in value)
     return value.upper()
 
 
+def _canonical_endpoint(value: str | list[str]) -> str:
+    """Canonical key fragment for an endpoint, stable across equivalent inputs."""
+    return "/".join(airport.name for airport in resolve_origin_or_city(value))
+
+
 def _session_key(legs: list[MultiCityLeg]) -> str:
     return "|".join(
-        f"{_format_endpoint(leg.origin)}-{_format_endpoint(leg.destination)}-{leg.date}"
+        f"{_canonical_endpoint(leg.origin)}-{_canonical_endpoint(leg.destination)}-{leg.date}"
         for leg in legs
     )
 
@@ -468,9 +473,10 @@ def _execute_multi_city_step(
     selection: int | None,
 ) -> dict[str, Any]:
     """Execute one step of a multi-city search. Exactly one API call per invocation."""
-    key = _session_key(params.legs)
+    key: str | None = None
 
     try:
+        key = _session_key(params.legs)
         cached = _search_sessions.get(key)
 
         if cached is None or selection is None:
@@ -521,11 +527,12 @@ def _execute_multi_city_step(
             filters, last_results = cached
             current_step = sum(1 for s in filters.flight_segments if s.selected_flight is not None)
 
-            if selection >= len(last_results):
+            if selection < 0 or selection >= len(last_results):
                 return {
                     "success": False,
                     "error": (
-                        f"Selection index {selection} out of range ({len(last_results)} options)"
+                        f"Selection index {selection} out of range"
+                        f" (valid: 0-{len(last_results) - 1})"
                     ),
                     "flights": [],
                 }

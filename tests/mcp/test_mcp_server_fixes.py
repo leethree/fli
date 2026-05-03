@@ -294,3 +294,65 @@ class TestCityResolutionFlow:
             _execute_flight_search(params)
 
         assert len(captured["segments"][0].departure_airport) == 2
+
+
+class TestSessionKeyCanonicalisation:
+    """Multi-city session key is stable across equivalent endpoint inputs."""
+
+    def test_metro_string_and_explicit_list_produce_same_key(self):
+        from fli.mcp.server import _session_key
+
+        a = _session_key([MultiCityLeg(origin="LON", destination="JFK", date="2027-06-01")])
+        b = _session_key(
+            [
+                MultiCityLeg(
+                    origin=["LHR", "LGW", "STN", "LCY", "LTN", "SEN"],
+                    destination="JFK",
+                    date="2027-06-01",
+                )
+            ]
+        )
+        assert a == b
+
+    def test_whitespace_variants_match(self):
+        from fli.mcp.server import _session_key
+
+        a = _session_key([MultiCityLeg(origin="JFK", destination="LHR", date="2027-06-01")])
+        b = _session_key([MultiCityLeg(origin=" jfk ", destination="lhr", date="2027-06-01")])
+        assert a == b
+
+    def test_different_endpoints_produce_different_keys(self):
+        from fli.mcp.server import _session_key
+
+        a = _session_key([MultiCityLeg(origin="JFK", destination="LHR", date="2027-06-01")])
+        b = _session_key([MultiCityLeg(origin="JFK", destination="CDG", date="2027-06-01")])
+        assert a != b
+
+
+class TestNegativeSelection:
+    """Multi-city selection should reject negative indices."""
+
+    def test_negative_selection_returns_error(self):
+        from fli.mcp.server import _execute_multi_city_step, _search_sessions
+
+        # Seed a fake cached session so the handler reaches the selection check.
+        fake_filters = MagicMock()
+        fake_filters.flight_segments = [MagicMock(selected_flight=None)] * 2
+        params = MultiCitySearchParams(
+            legs=[
+                MultiCityLeg(origin="JFK", destination="LHR", date="2027-06-01"),
+                MultiCityLeg(origin="LHR", destination="CDG", date="2027-06-05"),
+            ]
+        )
+        # Match the canonical key the handler will compute.
+        from fli.mcp.server import _session_key
+
+        key = _session_key(params.legs)
+        _search_sessions[key] = (fake_filters, ["flight_a", "flight_b", "flight_c"])
+
+        try:
+            result = _execute_multi_city_step(params, selection=-1)
+            assert result["success"] is False
+            assert "out of range" in result["error"]
+        finally:
+            _search_sessions.pop(key, None)
