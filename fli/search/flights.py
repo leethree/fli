@@ -192,7 +192,9 @@ class SearchFlights:
             # up so real bugs aren't swallowed.
             flight_combos = []
             timeout_skipped = 0
+            total_continuations = 0
             for selected_flight in flights[:top_n]:
+                total_continuations += 1
                 next_filters = deepcopy(filters)
                 next_filters.flight_segments[selected_count].selected_flight = selected_flight
                 try:
@@ -210,11 +212,18 @@ class SearchFlights:
                         else:
                             flight_combos.append((selected_flight, next_result))
 
-            # If every continuation timed out and we have nothing to
-            # return, surface the timeout so callers (notably the MCP
-            # layer) can classify it correctly instead of reporting a
-            # misleading "no flights" outcome.
-            if timeout_skipped > 0 and not flight_combos:
+            # Only surface a timeout when *every* continuation branch we
+            # attempted timed out (and produced nothing).  A mixed outcome
+            # — say one branch timed out and the other four returned
+            # legitimate "no onward flights" — is a real "no flights"
+            # result, not an API failure, and reporting it as a timeout
+            # would mislead the MCP layer into telling the agent to retry
+            # a query that's already shown its answer.
+            if (
+                total_continuations > 0
+                and timeout_skipped == total_continuations
+                and not flight_combos
+            ):
                 raise Exception(
                     f"All {timeout_skipped} multi-city continuation calls"
                     " timed out on the Google Flights API. Retry the search."

@@ -259,7 +259,9 @@ class TestParsePriceInfo:
 
 
 class TestEmptyBodyRetry:
-    """``_do_single_search`` must handle a *truly* empty HTTP body without
+    """Regression tests for the empty-body retry path in ``_do_single_search``.
+
+    ``_do_single_search`` must handle a *truly* empty HTTP body without
     raising — both the anti-XSSI-prefix-only case and the all-whitespace
     case — and the multi-leg retry path must actually fire on those bodies
     (not be bypassed by ``json.loads('')`` raising first).
@@ -269,6 +271,13 @@ class TestEmptyBodyRetry:
 
     @staticmethod
     def _multi_leg_filters() -> FlightSearchFilters:
+        """Build round-trip filters used to exercise the multi-leg retry path.
+
+        Returns:
+            A round-trip JFK↔LHR ``FlightSearchFilters`` with a
+            ``trip_type`` that triggers the multi-leg retry-on-empty rule.
+
+        """
         today = datetime.now()
         d1 = (today + timedelta(days=30)).strftime("%Y-%m-%d")
         d2 = (today + timedelta(days=37)).strftime("%Y-%m-%d")
@@ -291,6 +300,15 @@ class TestEmptyBodyRetry:
 
     @staticmethod
     def _one_way_filters() -> FlightSearchFilters:
+        """Build one-way filters used to verify retry is *not* triggered.
+
+        Returns:
+            A one-way JFK→LHR ``FlightSearchFilters``; one-way trips
+            should accept an empty body on the first attempt rather than
+            paying the retry latency for what's almost always a real
+            "no flights" answer.
+
+        """
         today = datetime.now()
         d = (today + timedelta(days=30)).strftime("%Y-%m-%d")
         return FlightSearchFilters(
@@ -305,16 +323,30 @@ class TestEmptyBodyRetry:
             ],
         )
 
-    def _make_response(self, text: str):
+    @staticmethod
+    def _make_response(text: str) -> "MagicMock":
+        """Create a minimal response-shaped mock with a configurable body.
+
+        Args:
+            text: The string the mock should expose on ``.text``.
+
+        Returns:
+            A ``MagicMock`` whose ``.text`` attribute returns *text*; all
+            other attributes/methods are auto-stubbed by ``MagicMock``.
+
+        """
         from unittest.mock import MagicMock
 
         resp = MagicMock()
         resp.text = text
         return resp
 
-    def test_truly_empty_body_does_not_raise_on_multi_leg(self):
-        """An HTTP 200 with empty body must NOT raise JSONDecodeError;
-        the retry must fire and ultimately return None on persistent empty.
+    def test_truly_empty_body_does_not_raise_on_multi_leg(self) -> None:
+        """An HTTP 200 with an empty body must not raise ``JSONDecodeError``.
+
+        The multi-leg retry path must fire on the empty body and, if the
+        retry also returns empty, the call must return ``None`` cleanly
+        instead of propagating a parser exception.
         """
         from unittest.mock import patch
 
@@ -328,8 +360,14 @@ class TestEmptyBodyRetry:
         # raised before the retry guard, we'd see 1 call and an exception.
         assert mock_post.call_count == 2
 
-    def test_anti_xssi_prefix_only_body_does_not_raise(self):
-        """The legacy anti-XSSI prefix on its own is still 'empty'."""
+    def test_anti_xssi_prefix_only_body_does_not_raise(self) -> None:
+        """A body containing only the anti-XSSI prefix is still 'empty'.
+
+        Google's frontend prefixes responses with ``)]}'`` to defeat
+        cross-site script inclusion; a body that's *only* the prefix is
+        no payload at all and must be treated identically to a
+        zero-length body for retry purposes.
+        """
         from unittest.mock import patch
 
         sf = SearchFlights()
@@ -340,9 +378,12 @@ class TestEmptyBodyRetry:
         assert result is None
         assert mock_post.call_count == 2
 
-    def test_one_way_does_not_retry_on_empty_body(self):
-        """One-way queries are reliable enough that retry-on-empty just
-        slows down legitimate "no flights" results — single attempt only.
+    def test_one_way_does_not_retry_on_empty_body(self) -> None:
+        """One-way queries must accept an empty body without retrying.
+
+        The one-way endpoint is reliable enough that an empty response
+        is almost always a real "no flights" outcome; retrying it just
+        adds ~60 s of latency for no benefit.
         """
         from unittest.mock import patch
 
@@ -354,9 +395,13 @@ class TestEmptyBodyRetry:
         assert result is None
         assert mock_post.call_count == 1
 
-    def test_retry_recovers_when_second_attempt_returns_data(self):
-        """If the first body is empty but the retry succeeds, the parsed
-        flights must be returned (the retry isn't decorative)."""
+    def test_retry_recovers_when_second_attempt_returns_data(self) -> None:
+        """A successful retry after an empty first attempt must return the parsed flights.
+
+        Proves the retry path isn't decorative: if the second attempt
+        returns a parseable envelope, the call yields the parsed result
+        rather than bailing on the first empty.
+        """
         from unittest.mock import patch
 
         # Minimal valid envelope.  Outer JSON is a list whose ``[0][2]``
@@ -377,3 +422,138 @@ class TestEmptyBodyRetry:
         # actually parsed the warm response and didn't bail early.
         assert result == []
         assert mock_post.call_count == 2
+
+
+class TestRecursionTimeoutPolicy:
+    """``SearchFlights.search``'s per-iteration timeout handling must
+    distinguish 'every continuation timed out' (real API failure, raise)
+    from 'one branch timed out, others legitimately had no flights'
+    (real zero-result, return empty).
+
+    Regression test for the CodeRabbit review on leethree/fli#2 — the
+    previous condition ``timeout_skipped > 0 and not flight_combos``
+    raised on mixed outcomes and surfaced a false-positive timeout.
+    """
+
+    @staticmethod
+    def _round_trip_filters() -> FlightSearchFilters:
+        """Build round-trip filters that exercise the recursion path.
+
+        Returns:
+            A round-trip ``FlightSearchFilters`` whose ``trip_type``
+            triggers the multi-leg recursion in ``SearchFlights.search``.
+
+        """
+        today = datetime.now()
+        d1 = (today + timedelta(days=30)).strftime("%Y-%m-%d")
+        d2 = (today + timedelta(days=37)).strftime("%Y-%m-%d")
+        return FlightSearchFilters(
+            trip_type=TripType.ROUND_TRIP,
+            passenger_info=PassengerInfo(adults=1),
+            flight_segments=[
+                FlightSegment(
+                    departure_airport=[[Airport.JFK, 0]],
+                    arrival_airport=[[Airport.LHR, 0]],
+                    travel_date=d1,
+                ),
+                FlightSegment(
+                    departure_airport=[[Airport.LHR, 0]],
+                    arrival_airport=[[Airport.JFK, 0]],
+                    travel_date=d2,
+                ),
+            ],
+        )
+
+    @staticmethod
+    def _flight_with_legs(price: float = 100.0) -> "MagicMock":
+        """Build a minimal ``FlightResult``-shaped mock the recursion can deepcopy.
+
+        ``SearchFlights.search`` calls ``deepcopy(filters)`` on each
+        iteration and assigns the picked option to
+        ``flight_segments[N].selected_flight``.  The mock just needs to
+        survive ``deepcopy`` and not interfere with the recursion's
+        bookkeeping (it isn't introspected).
+
+        Returns:
+            A ``MagicMock`` that walks like a ``FlightResult`` enough for
+            the recursion's purposes.
+
+        """
+        from unittest.mock import MagicMock
+
+        f = MagicMock()
+        f.price = price
+        return f
+
+    def test_mixed_timeout_and_empty_returns_empty_not_raise(self) -> None:
+        """A mix of one timeout and several empty continuations must return ``[]``.
+
+        Without this distinction, the previous code raised on any
+        ``timeout_skipped > 0 and not flight_combos`` outcome — which
+        wrongly told MCP callers to retry queries that had already
+        exhaustively answered "no onward flights on those branches".
+        """
+        from unittest.mock import patch
+
+        sf = SearchFlights()
+        leg1_options = [self._flight_with_legs(p) for p in (100.0, 200.0, 300.0)]
+        timeout_exc = Exception("Timeout: Operation timed out")
+
+        # ``search`` recurses into itself; mock the recursive call so the
+        # outer entry is the real method (so we exercise the real
+        # post-loop ``raise_condition`` from production code).  The
+        # recursive calls get a fake that emits one timeout, two empties.
+        original_search = SearchFlights.search
+
+        recursive_call_count = {"n": 0}
+
+        def fake_recursive(self_, filters, top_n=5):
+            # The outer call sees no selected_flight; let it through to
+            # the real implementation.
+            if all(s.selected_flight is None for s in filters.flight_segments):
+                # Bypass the real network call by feeding leg-1 results
+                # directly via ``_do_single_search`` patch (below).
+                return original_search(self_, filters, top_n)
+            # Recursive (continuation) call: deterministic outcome.
+            i = recursive_call_count["n"]
+            recursive_call_count["n"] += 1
+            if i == 0:
+                raise timeout_exc
+            return None  # legitimate "no onward flights"
+
+        with patch.object(SearchFlights, "search", autospec=True, side_effect=fake_recursive):
+            with patch.object(sf, "_do_single_search", return_value=leg1_options):
+                result = sf.search(self._round_trip_filters(), top_n=3)
+
+        # 3 continuations attempted, 1 timed out, 2 empties → flight_combos
+        # is empty but the trip is real "no flights", so we return [] cleanly.
+        assert result == []
+        assert recursive_call_count["n"] == 3
+
+    def test_all_continuations_timeout_does_raise(self) -> None:
+        """When *every* continuation times out, surface the timeout.
+
+        The outer call must raise so the MCP layer can report a transient
+        backend stall rather than a misleading "no flights" result.
+        """
+        from unittest.mock import patch
+
+        sf = SearchFlights()
+        leg1_options = [self._flight_with_legs(p) for p in (100.0, 200.0, 300.0)]
+        timeout_exc = Exception("Timeout: Operation timed out")
+
+        original_search = SearchFlights.search
+
+        def fake_recursive(self_, filters, top_n=5):
+            if all(s.selected_flight is None for s in filters.flight_segments):
+                return original_search(self_, filters, top_n)
+            raise timeout_exc
+
+        with patch.object(SearchFlights, "search", autospec=True, side_effect=fake_recursive):
+            with patch.object(sf, "_do_single_search", return_value=leg1_options):
+                with pytest.raises(Exception) as exc_info:
+                    sf.search(self._round_trip_filters(), top_n=3)
+
+        # The outer ``except Exception`` wrapper rebrands the message,
+        # but the underlying "All N timed out" text must survive.
+        assert "timed out" in str(exc_info.value).lower()
