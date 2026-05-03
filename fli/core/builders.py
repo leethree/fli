@@ -9,6 +9,14 @@ from datetime import datetime, timedelta
 from fli.models import Airport, FlightSegment, TimeRestrictions, TripType
 
 
+def _as_airport_list(value: "Airport | list[Airport]") -> list[Airport]:
+    """Normalize a single airport or list of airports into a non-empty list."""
+    airports = [value] if isinstance(value, Airport) else list(value)
+    if not airports:
+        raise ValueError("At least one airport is required")
+    return airports
+
+
 def normalize_date(date_str: str) -> str:
     """Normalize a date string to zero-padded YYYY-MM-DD format.
 
@@ -66,8 +74,8 @@ def build_time_restrictions(
 
 
 def build_flight_segments(
-    origin: Airport,
-    destination: Airport,
+    origin: Airport | list[Airport],
+    destination: Airport | list[Airport],
     departure_date: str,
     return_date: str | None = None,
     time_restrictions: TimeRestrictions | None = None,
@@ -75,8 +83,9 @@ def build_flight_segments(
     """Build flight segments for a search request.
 
     Args:
-        origin: Departure airport
-        destination: Arrival airport
+        origin: Departure airport, or list of airports for a metro / "any of"
+            search (e.g. ``[LHR, LGW, STN]`` for London).
+        destination: Arrival airport, or list of airports for a metro search.
         departure_date: Outbound travel date in YYYY-MM-DD format
         return_date: Return travel date in YYYY-MM-DD format (optional)
         time_restrictions: Time restrictions to apply to segments
@@ -85,12 +94,15 @@ def build_flight_segments(
         Tuple of (list of FlightSegment objects, TripType)
 
     """
+    origins = _as_airport_list(origin)
+    destinations = _as_airport_list(destination)
+
     departure_date = normalize_date(departure_date)
 
     segments = [
         FlightSegment(
-            departure_airport=[[origin, 0]],
-            arrival_airport=[[destination, 0]],
+            departure_airport=[[a, 0] for a in origins],
+            arrival_airport=[[a, 0] for a in destinations],
             travel_date=departure_date,
             time_restrictions=time_restrictions,
         )
@@ -103,8 +115,8 @@ def build_flight_segments(
         trip_type = TripType.ROUND_TRIP
         segments.append(
             FlightSegment(
-                departure_airport=[[destination, 0]],
-                arrival_airport=[[origin, 0]],
+                departure_airport=[[a, 0] for a in destinations],
+                arrival_airport=[[a, 0] for a in origins],
                 travel_date=return_date,
                 time_restrictions=time_restrictions,
             )
@@ -114,13 +126,15 @@ def build_flight_segments(
 
 
 def build_multi_city_segments(
-    legs: list[tuple[Airport, Airport, str]],
+    legs: list[tuple[Airport | list[Airport], Airport | list[Airport], str]],
     time_restrictions: TimeRestrictions | None = None,
 ) -> tuple[list[FlightSegment], TripType]:
     """Build flight segments for a multi-city search.
 
     Args:
-        legs: List of (origin, destination, date) tuples for each leg
+        legs: List of (origin, destination, date) tuples for each leg.  Each
+            origin or destination may be a single :class:`Airport` or a list
+            of airports (for IATA metropolitan / "any of" searches).
         time_restrictions: Time restrictions to apply to all segments
 
     Returns:
@@ -134,8 +148,8 @@ def build_multi_city_segments(
     """
     segments = [
         FlightSegment(
-            departure_airport=[[origin, 0]],
-            arrival_airport=[[destination, 0]],
+            departure_airport=[[a, 0] for a in _as_airport_list(origin)],
+            arrival_airport=[[a, 0] for a in _as_airport_list(destination)],
             travel_date=normalize_date(date),
             time_restrictions=time_restrictions,
         )
@@ -146,8 +160,8 @@ def build_multi_city_segments(
 
 
 def build_date_search_segments(
-    origin: Airport,
-    destination: Airport,
+    origin: Airport | list[Airport],
+    destination: Airport | list[Airport],
     start_date: str,
     trip_duration: int | None = None,
     is_round_trip: bool = False,
@@ -156,8 +170,8 @@ def build_date_search_segments(
     """Build flight segments for a date range search.
 
     Args:
-        origin: Departure airport
-        destination: Arrival airport
+        origin: Departure airport, or list of airports for a metro search.
+        destination: Arrival airport, or list of airports for a metro search.
         start_date: Start date of the search range in YYYY-MM-DD format
         trip_duration: Duration of the trip in days (for round trips)
         is_round_trip: Whether to search for round-trip flights
@@ -167,12 +181,15 @@ def build_date_search_segments(
         Tuple of (list of FlightSegment objects, TripType)
 
     """
+    origins = _as_airport_list(origin)
+    destinations = _as_airport_list(destination)
+
     start_date = normalize_date(start_date)
 
     segments = [
         FlightSegment(
-            departure_airport=[[origin, 0]],
-            arrival_airport=[[destination, 0]],
+            departure_airport=[[a, 0] for a in origins],
+            arrival_airport=[[a, 0] for a in destinations],
             travel_date=start_date,
             time_restrictions=time_restrictions,
         )
@@ -188,8 +205,8 @@ def build_date_search_segments(
 
         segments.append(
             FlightSegment(
-                departure_airport=[[destination, 0]],
-                arrival_airport=[[origin, 0]],
+                departure_airport=[[a, 0] for a in destinations],
+                arrival_airport=[[a, 0] for a in origins],
                 travel_date=return_date,
                 time_restrictions=time_restrictions,
             )

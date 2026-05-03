@@ -25,7 +25,7 @@ from fli.core import (
     parse_emissions,
     parse_max_stops,
     parse_sort_by,
-    resolve_airport,
+    resolve_origin_or_city,
 )
 from fli.core.parsers import ParseError
 from fli.models import (
@@ -85,11 +85,26 @@ mcp = FastMCP("Flight Search MCP Server")
 # =============================================================================
 
 
+_ORIGIN_FIELD_DESCRIPTION = (
+    "Departure airport IATA code, IATA city/metro code, or list. "
+    "Pass a single airport like 'JFK', a metro code like 'LON' (expands to "
+    "LHR/LGW/STN/LCY/LTN/SEN), 'NYC' (JFK/LGA/EWR), 'PAR', 'ROM', 'MIL', "
+    "'TYO', 'OSA', 'CHI', 'BUE', 'SAO', 'RIO', 'SHA', 'BJS', 'SEL', etc., "
+    "or an explicit array like ['LHR', 'LGW']."
+)
+_DESTINATION_FIELD_DESCRIPTION = (
+    "Arrival airport IATA code, IATA city/metro code, or list. "
+    "Pass a single airport like 'LHR', a metro code like 'LON' / 'NYC' / "
+    "'TYO' / 'PAR' (expands to all that metro's airports), or an explicit "
+    "array like ['JFK', 'EWR']."
+)
+
+
 class FlightSearchParams(BaseModel):
     """Parameters for searching flights on a specific date."""
 
-    origin: str = Field(description="Departure airport IATA code (e.g., 'JFK', 'LAX')")
-    destination: str = Field(description="Arrival airport IATA code (e.g., 'LHR', 'NRT')")
+    origin: str | list[str] = Field(description=_ORIGIN_FIELD_DESCRIPTION)
+    destination: str | list[str] = Field(description=_DESTINATION_FIELD_DESCRIPTION)
     departure_date: str = Field(description="Outbound travel date in YYYY-MM-DD format")
     return_date: str | None = Field(
         None, description="Return date in YYYY-MM-DD format (omit for one-way)"
@@ -132,8 +147,8 @@ class FlightSearchParams(BaseModel):
 class MultiCityLeg(BaseModel):
     """A single leg of a multi-city itinerary."""
 
-    origin: str = Field(description="Departure airport IATA code (e.g., 'JFK')")
-    destination: str = Field(description="Arrival airport IATA code (e.g., 'LHR')")
+    origin: str | list[str] = Field(description=_ORIGIN_FIELD_DESCRIPTION)
+    destination: str | list[str] = Field(description=_DESTINATION_FIELD_DESCRIPTION)
     date: str = Field(description="Travel date in YYYY-MM-DD format")
 
 
@@ -182,8 +197,8 @@ class MultiCitySearchParams(BaseModel):
 class DateSearchParams(BaseModel):
     """Parameters for finding the cheapest travel dates within a range."""
 
-    origin: str = Field(description="Departure airport IATA code (e.g., 'JFK', 'LAX')")
-    destination: str = Field(description="Arrival airport IATA code (e.g., 'LHR', 'NRT')")
+    origin: str | list[str] = Field(description=_ORIGIN_FIELD_DESCRIPTION)
+    destination: str | list[str] = Field(description=_DESTINATION_FIELD_DESCRIPTION)
     start_date: str = Field(description="Start of date range in YYYY-MM-DD format")
     end_date: str = Field(description="End of date range in YYYY-MM-DD format")
     trip_duration: int = Field(
@@ -282,8 +297,8 @@ def _execute_flight_search(params: FlightSearchParams) -> dict[str, Any]:
     """Execute a flight search and return formatted results."""
     try:
         # Parse inputs using shared utilities
-        origin = resolve_airport(params.origin)
-        destination = resolve_airport(params.destination)
+        origin = resolve_origin_or_city(params.origin)
+        destination = resolve_origin_or_city(params.destination)
         cabin_class = parse_cabin_class(params.cabin_class)
         max_stops = parse_max_stops(params.max_stops)
         sort_by = parse_sort_by(params.sort_by)
@@ -357,8 +372,8 @@ def _execute_date_search(params: DateSearchParams) -> dict[str, Any]:
     """Execute a date search and return formatted results."""
     try:
         # Parse inputs using shared utilities
-        origin = resolve_airport(params.origin)
-        destination = resolve_airport(params.destination)
+        origin = resolve_origin_or_city(params.origin)
+        destination = resolve_origin_or_city(params.destination)
         cabin_class = parse_cabin_class(params.cabin_class)
         max_stops = parse_max_stops(params.max_stops)
         airlines = parse_airlines(params.airlines)
@@ -434,19 +449,34 @@ def _execute_date_search(params: DateSearchParams) -> dict[str, Any]:
 _search_sessions: dict[str, tuple[Any, list[Any]]] = {}
 
 
+def _format_endpoint(value: str | list[str]) -> str:
+    """Format an origin/destination value (string or list) for display."""
+    if isinstance(value, list):
+        return "/".join(v.upper() for v in value)
+    return value.upper()
+
+
+def _canonical_endpoint(value: str | list[str]) -> str:
+    """Canonical key fragment for an endpoint, stable across equivalent inputs."""
+    return "/".join(airport.name for airport in resolve_origin_or_city(value))
+
+
 def _session_key(legs: list[MultiCityLeg]) -> str:
     return "|".join(
-        f"{leg.origin}-{leg.destination}-{leg.date}" for leg in legs
+        f"{_canonical_endpoint(leg.origin)}-{_canonical_endpoint(leg.destination)}-{leg.date}"
+        for leg in legs
     )
 
 
 def _execute_multi_city_step(
-    params: MultiCitySearchParams, selection: int | None,
+    params: MultiCitySearchParams,
+    selection: int | None,
 ) -> dict[str, Any]:
     """Execute one step of a multi-city search. Exactly one API call per invocation."""
-    key = _session_key(params.legs)
+    key: str | None = None
 
     try:
+        key = _session_key(params.legs)
         cached = _search_sessions.get(key)
 
         if cached is None or selection is None:
@@ -455,17 +485,17 @@ def _execute_multi_city_step(
             sort_by = parse_sort_by(params.sort_by)
             airlines = parse_airlines(params.airlines)
 
-            departure_window = (
-                params.departure_window or CONFIG.default_departure_window
-            )
+            departure_window = params.departure_window or CONFIG.default_departure_window
             time_restrictions = (
-                build_time_restrictions(departure_window)
-                if departure_window
-                else None
+                build_time_restrictions(departure_window) if departure_window else None
             )
 
             resolved_legs = [
-                (resolve_airport(leg.origin), resolve_airport(leg.destination), leg.date)
+                (
+                    resolve_origin_or_city(leg.origin),
+                    resolve_origin_or_city(leg.destination),
+                    leg.date,
+                )
                 for leg in params.legs
             ]
 
@@ -495,16 +525,14 @@ def _execute_multi_city_step(
             current_step = 0
         else:
             filters, last_results = cached
-            current_step = sum(
-                1 for s in filters.flight_segments if s.selected_flight is not None
-            )
+            current_step = sum(1 for s in filters.flight_segments if s.selected_flight is not None)
 
-            if selection >= len(last_results):
+            if selection < 0 or selection >= len(last_results):
                 return {
                     "success": False,
                     "error": (
                         f"Selection index {selection} out of range"
-                        f" ({len(last_results)} options)"
+                        f" (valid: 0-{len(last_results) - 1})"
                     ),
                     "flights": [],
                 }
@@ -555,8 +583,8 @@ def _execute_multi_city_step(
             "step": current_step + 1,
             "total_legs": num_legs,
             "leg": (
-                f"{params.legs[current_step].origin}"
-                f" -> {params.legs[current_step].destination}"
+                f"{_format_endpoint(params.legs[current_step].origin)}"
+                f" -> {_format_endpoint(params.legs[current_step].destination)}"
                 f" ({params.legs[current_step].date})"
             ),
             "is_final": is_final,
@@ -577,7 +605,7 @@ def _execute_multi_city_step(
             resp["message"] = (
                 f"Showing options for leg {current_step + 1} of"
                 f" {num_legs}. Pick a flight by index"
-                f" (0-{len(flight_results)-1}) and call again"
+                f" (0-{len(flight_results) - 1}) and call again"
                 " with selection=<index>."
             )
 
@@ -607,8 +635,8 @@ def _execute_multi_city_step(
     },
 )
 def search_flights(
-    origin: Annotated[str, Field(description="Departure airport IATA code (e.g., 'JFK')")],
-    destination: Annotated[str, Field(description="Arrival airport IATA code (e.g., 'LHR')")],
+    origin: Annotated[str | list[str], Field(description=_ORIGIN_FIELD_DESCRIPTION)],
+    destination: Annotated[str | list[str], Field(description=_DESTINATION_FIELD_DESCRIPTION)],
     departure_date: Annotated[str, Field(description="Travel date in YYYY-MM-DD format")],
     return_date: Annotated[
         str | None,
@@ -701,8 +729,8 @@ def _search_flights_from_params(params: FlightSearchParams) -> dict[str, Any]:
     },
 )
 def search_dates(
-    origin: Annotated[str, Field(description="Departure airport IATA code (e.g., 'JFK')")],
-    destination: Annotated[str, Field(description="Arrival airport IATA code (e.g., 'LHR')")],
+    origin: Annotated[str | list[str], Field(description=_ORIGIN_FIELD_DESCRIPTION)],
+    destination: Annotated[str | list[str], Field(description=_DESTINATION_FIELD_DESCRIPTION)],
     start_date: Annotated[str, Field(description="Start of date range in YYYY-MM-DD format")],
     end_date: Annotated[str, Field(description="End of date range in YYYY-MM-DD format")],
     trip_duration: Annotated[
@@ -775,13 +803,20 @@ def _search_dates_from_params(params: DateSearchParams) -> dict[str, Any]:
 )
 def search_multi_city(
     legs: Annotated[
-        list[dict[str, str]],
+        list[dict[str, Any]],
         Field(
             description=(
-                "List of flight legs. Each leg is an object with 'origin' (IATA code), "
-                "'destination' (IATA code), and 'date' (YYYY-MM-DD). "
-                "Example: [{'origin': 'JFK', 'destination': 'LHR', 'date': '2026-06-01'}, "
-                "{'origin': 'LHR', 'destination': 'CDG', 'date': '2026-06-05'}]"
+                "List of flight legs. Each leg is an object with 'origin', "
+                "'destination', and 'date' (YYYY-MM-DD). 'origin' and "
+                "'destination' may be a single IATA airport code "
+                "('JFK'), an IATA city/metro code ('LON', 'NYC', 'TYO', "
+                "'PAR', 'ROM', 'MIL', 'CHI', 'BUE', 'SAO', 'RIO', 'SHA', "
+                "'BJS', 'SEL', 'OSA', 'MOW', 'STO', 'YTO', 'YMQ', 'WAS', "
+                "'JKT'), or a list of codes (['LHR', 'LGW']). City codes "
+                "expand to all metro airports. "
+                "Example: [{'origin': 'NYC', 'destination': 'LON', 'date': "
+                "'2026-06-01'}, {'origin': 'LON', 'destination': 'PAR', "
+                "'date': '2026-06-05'}]"
             ),
             min_length=2,
         ),

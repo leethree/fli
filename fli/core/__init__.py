@@ -20,6 +20,7 @@ from .parsers import (
     parse_time_range,
     resolve_airport,
     resolve_enum,
+    resolve_origin_or_city,
 )
 
 __all__ = [
@@ -32,6 +33,7 @@ __all__ = [
     "parse_time_range",
     "resolve_airport",
     "resolve_enum",
+    "resolve_origin_or_city",
     # Builders
     "build_date_search_segments",
     "build_flight_segments",

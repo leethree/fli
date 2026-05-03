@@ -63,10 +63,7 @@ class SearchFlights:
             return None
         decoded = json.loads(parsed)
         flights_data = [
-            item
-            for i in [2, 3]
-            if isinstance(decoded[i], list)
-            for item in decoded[i][0]
+            item for i in [2, 3] if isinstance(decoded[i], list) for item in decoded[i][0]
         ]
         flights = [self._parse_flights_data(flight) for flight in flights_data]
 
