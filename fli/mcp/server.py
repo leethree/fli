@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from fli.core import (
@@ -101,6 +101,36 @@ _DESTINATION_FIELD_DESCRIPTION = (
 )
 
 
+def _coerce_json_list_string(value: Any) -> Any:
+    """Pre-validation hook: unwrap a JSON-encoded list passed as a string.
+
+    Some MCP transports / agent setups serialize array tool arguments as
+    JSON strings before they reach the server (the LLM emits
+    ``["CZ","BA"]`` and the transport encodes it once more, so the tool
+    receives the literal string ``'["CZ", "BA"]'``).  Pydantic then
+    rejects with ``Input should be a valid list``, which made the
+    ``airlines=`` filter unusable from those clients (Issue C in the
+    2026-05-03 BUGREPORT).
+
+    The fix is intentionally conservative — only acts on strings whose
+    stripped form looks like a JSON array (``[...]``) and only when JSON
+    parsing yields a list.  Anything else (a bare IATA code, a metro
+    code like ``"LON"``, ``None``, an actual list) flows through
+    unchanged so legitimate single-string inputs to the
+    ``str | list[str]`` union types aren't disturbed.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                return value
+            if isinstance(parsed, list):
+                return parsed
+    return value
+
+
 class FlightSearchParams(BaseModel):
     """Parameters for searching flights on a specific date."""
 
@@ -144,6 +174,16 @@ class FlightSearchParams(BaseModel):
         True, description="Return all available results instead of curated ~30"
     )
 
+    # See ``_coerce_json_list_string`` for why this hook exists — some
+    # MCP transports re-encode list arguments as JSON strings before
+    # they reach Pydantic.  Apply to every list-typed field on this
+    # model so the same fix covers ``airlines`` (Issue C in the
+    # BUGREPORT) and the ``origin`` / ``destination`` union types (same
+    # transport bug, just hadn't been hit yet).
+    _coerce_lists = field_validator(
+        "origin", "destination", "airlines", mode="before"
+    )(_coerce_json_list_string)
+
 
 class MultiCityLeg(BaseModel):
     """A single leg of a multi-city itinerary."""
@@ -151,6 +191,10 @@ class MultiCityLeg(BaseModel):
     origin: str | list[str] = Field(description=_ORIGIN_FIELD_DESCRIPTION)
     destination: str | list[str] = Field(description=_DESTINATION_FIELD_DESCRIPTION)
     date: str = Field(description="Travel date in YYYY-MM-DD format")
+
+    _coerce_lists = field_validator("origin", "destination", mode="before")(
+        _coerce_json_list_string
+    )
 
 
 class MultiCitySearchParams(BaseModel):
@@ -194,6 +238,12 @@ class MultiCitySearchParams(BaseModel):
         True, description="Return all available results instead of curated ~30"
     )
 
+    # ``legs`` is also list-shaped and shows the same transport-encoding
+    # symptom — covered here so the same fix protects both.
+    _coerce_lists = field_validator("legs", "airlines", mode="before")(
+        _coerce_json_list_string
+    )
+
 
 class DateSearchParams(BaseModel):
     """Parameters for finding the cheapest travel dates within a range."""
@@ -225,6 +275,10 @@ class DateSearchParams(BaseModel):
         ge=1,
         description="Number of adult passengers",
     )
+
+    _coerce_lists = field_validator(
+        "origin", "destination", "airlines", mode="before"
+    )(_coerce_json_list_string)
 
 
 # =============================================================================

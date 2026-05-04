@@ -763,3 +763,141 @@ class TestMultiCityToolAnnotations:
         assert sf.annotations.idempotentHint is True
         assert sd.annotations.readOnlyHint is True
         assert sd.annotations.idempotentHint is True
+
+
+# ---------------------------------------------------------------------------
+# Issue C from BUGREPORT 2026-05-03: airlines / origin / destination /
+# legs passed as JSON-encoded strings (some MCP transports re-encode list
+# arguments before they reach Pydantic, so the model receives the literal
+# string ``'["CZ", "BA"]'`` and rejects it as "not a list").
+# ---------------------------------------------------------------------------
+
+
+class TestJsonStringListCoercion:
+    """List-shaped MCP params accept JSON-encoded string forms transparently."""
+
+    def test_airlines_from_json_string_on_flight_params(self) -> None:
+        """``airlines='["CZ", "BA"]'`` must coerce to ``['CZ', 'BA']``."""
+        p = FlightSearchParams(
+            origin="JFK",
+            destination="LHR",
+            departure_date="2027-06-01",
+            airlines='["CZ", "BA"]',
+        )
+        assert p.airlines == ["CZ", "BA"]
+
+    def test_airlines_from_json_string_on_multi_city(self) -> None:
+        """Same coercion applies to MultiCitySearchParams.airlines."""
+        p = MultiCitySearchParams(
+            legs=[
+                MultiCityLeg(origin="JFK", destination="LHR", date="2027-06-01"),
+                MultiCityLeg(origin="LHR", destination="CDG", date="2027-06-05"),
+            ],
+            airlines='["CZ", "BA"]',
+        )
+        assert p.airlines == ["CZ", "BA"]
+
+    def test_airlines_from_json_string_on_date_params(self) -> None:
+        """Same coercion applies to DateSearchParams.airlines."""
+        p = DateSearchParams(
+            origin="JFK",
+            destination="LHR",
+            start_date="2027-06-01",
+            end_date="2027-06-30",
+            airlines='["BA"]',
+        )
+        assert p.airlines == ["BA"]
+
+    def test_origin_from_json_string(self) -> None:
+        """``origin='["LHR", "LGW"]'`` must coerce to a list (FlightSearchParams)."""
+        p = FlightSearchParams(
+            origin='["LHR", "LGW"]',
+            destination="JFK",
+            departure_date="2027-06-01",
+        )
+        assert p.origin == ["LHR", "LGW"]
+
+    def test_destination_from_json_string(self) -> None:
+        """``destination='["JFK", "EWR"]'`` must coerce on MultiCityLeg too."""
+        leg = MultiCityLeg(
+            origin="LHR",
+            destination='["JFK", "EWR"]',
+            date="2027-06-01",
+        )
+        assert leg.destination == ["JFK", "EWR"]
+
+    def test_legs_from_json_string(self) -> None:
+        """``legs`` passed as a JSON-encoded array of objects must parse cleanly."""
+        legs_json = (
+            '[{"origin":"JFK","destination":"LHR","date":"2027-06-01"},'
+            '{"origin":"LHR","destination":"CDG","date":"2027-06-05"}]'
+        )
+        p = MultiCitySearchParams(legs=legs_json)
+        assert len(p.legs) == 2
+        assert p.legs[0].origin == "JFK"
+        assert p.legs[1].destination == "CDG"
+
+    def test_bare_metro_code_string_not_coerced(self) -> None:
+        """A legitimate bare string like ``'LON'`` must NOT be touched.
+
+        The coercion only fires on strings that look like a JSON list
+        (``[...]``); IATA codes and metro codes flow through to the
+        existing ``str | list[str]`` union path.
+        """
+        p = FlightSearchParams(origin="LON", destination="JFK", departure_date="2027-06-01")
+        assert p.origin == "LON"
+        assert isinstance(p.origin, str)
+
+    def test_bare_airport_code_string_not_coerced(self) -> None:
+        """``origin='JFK'`` stays a string."""
+        p = FlightSearchParams(origin="JFK", destination="LHR", departure_date="2027-06-01")
+        assert p.origin == "JFK"
+
+    def test_already_a_list_passes_through(self) -> None:
+        """The happy-path list input must remain unchanged."""
+        p = FlightSearchParams(
+            origin=["LHR", "LGW"],
+            destination="JFK",
+            departure_date="2027-06-01",
+            airlines=["CZ"],
+        )
+        assert p.origin == ["LHR", "LGW"]
+        assert p.airlines == ["CZ"]
+
+    def test_none_airlines_unchanged(self) -> None:
+        """``airlines=None`` is the default and must stay ``None``."""
+        p = FlightSearchParams(
+            origin="JFK",
+            destination="LHR",
+            departure_date="2027-06-01",
+            airlines=None,
+        )
+        assert p.airlines is None
+
+    def test_malformed_json_string_still_rejected_for_airlines(self) -> None:
+        """A malformed JSON-list-like string falls through to Pydantic, which
+        then rejects it as not-a-list rather than swallowing the bad input."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            FlightSearchParams(
+                origin="JFK",
+                destination="LHR",
+                departure_date="2027-06-01",
+                airlines="[CZ, BA]",  # not valid JSON (unquoted)
+            )
+
+    def test_non_list_json_not_coerced(self) -> None:
+        """Strings that parse as non-list JSON (object, number) flow
+        through to the type validator unchanged."""
+        # ``'{"x": 1}'`` parses but isn't a list, so the coercer returns
+        # the original string and Pydantic decides what to do.
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            FlightSearchParams(
+                origin="JFK",
+                destination="LHR",
+                departure_date="2027-06-01",
+                airlines='{"x": 1}',
+            )
