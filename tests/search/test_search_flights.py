@@ -742,3 +742,245 @@ class TestRetryPredicate:
                 # Concrete subclass, not generic ``Exception``.
                 assert isinstance(e, Timeout)
                 assert "timed out" in str(e).lower()
+
+
+class TestClientTimeoutConstants:
+    """Pin the timeout-related constants and the ``setdefault`` injection.
+
+    Verify the constants introduced by this PR are set to the
+    documented values and that the ``setdefault`` logic injects them
+    correctly.  These are not integration tests — they pin the
+    *class-level* constant values and the ``setdefault`` injection
+    logic so future edits that accidentally alter the values are
+    caught by CI before they land.
+    """
+
+    def test_default_timeout_value(self) -> None:
+        """DEFAULT_TIMEOUT must be 25 seconds."""
+        from fli.search.client import Client
+
+        assert Client.DEFAULT_TIMEOUT == 25
+
+    def test_retry_total_delay_value(self) -> None:
+        """RETRY_TOTAL_DELAY must be 24 seconds.
+
+        Just under the 25 s per-request cap so the delay-stop fires
+        before a second full-timeout attempt could complete.
+        """
+        from fli.search.client import Client
+
+        assert Client.RETRY_TOTAL_DELAY == 24
+
+    def test_get_injects_default_timeout_when_not_provided(self) -> None:
+        """``Client.get`` injects ``timeout=DEFAULT_TIMEOUT`` by default.
+
+        Calls the underlying session with the class default when the
+        caller doesn't pass an explicit timeout.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from fli.search.client import Client
+
+        c = Client()
+        fake_response = MagicMock()
+        fake_response.raise_for_status = MagicMock()
+
+        with patch.object(c._client, "get", return_value=fake_response) as mock_get:
+            c.get("https://example.com")
+
+        _, kwargs = mock_get.call_args
+        assert kwargs.get("timeout") == Client.DEFAULT_TIMEOUT
+
+    def test_post_injects_default_timeout_when_not_provided(self) -> None:
+        """``Client.post`` injects ``timeout=DEFAULT_TIMEOUT`` by default.
+
+        Calls the underlying session with the class default when the
+        caller doesn't pass an explicit timeout.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from fli.search.client import Client
+
+        c = Client()
+        fake_response = MagicMock()
+        fake_response.raise_for_status = MagicMock()
+
+        with patch.object(c._client, "post", return_value=fake_response) as mock_post:
+            c.post("https://example.com")
+
+        _, kwargs = mock_post.call_args
+        assert kwargs.get("timeout") == Client.DEFAULT_TIMEOUT
+
+    def test_get_preserves_explicit_timeout(self) -> None:
+        """``setdefault`` must NOT override an explicitly provided timeout."""
+        from unittest.mock import MagicMock, patch
+
+        from fli.search.client import Client
+
+        c = Client()
+        fake_response = MagicMock()
+        fake_response.raise_for_status = MagicMock()
+
+        with patch.object(c._client, "get", return_value=fake_response) as mock_get:
+            c.get("https://example.com", timeout=5)
+
+        _, kwargs = mock_get.call_args
+        assert kwargs.get("timeout") == 5
+
+    def test_post_preserves_explicit_timeout(self) -> None:
+        """``setdefault`` must NOT override an explicitly provided timeout."""
+        from unittest.mock import MagicMock, patch
+
+        from fli.search.client import Client
+
+        c = Client()
+        fake_response = MagicMock()
+        fake_response.raise_for_status = MagicMock()
+
+        with patch.object(c._client, "post", return_value=fake_response) as mock_post:
+            c.post("https://example.com", timeout=10)
+
+        _, kwargs = mock_post.call_args
+        assert kwargs.get("timeout") == 10
+
+
+# ---------------------------------------------------------------------------
+# _EMPTY_RETRIES_MULTI_LEG constant and per-trip-type retry distinction
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyRetryConstant:
+    """Coverage for the ``_EMPTY_RETRIES_MULTI_LEG`` constant.
+
+    The constant controls application-level retry-on-empty for
+    multi-leg queries.  By default it is 0 (no retry) to fit MCP
+    transport budgets; the existing TestEmptyBodyRetry class covers
+    that.  These tests add coverage for the constant's value itself
+    and for the trip-type branching that gates whether retry fires at
+    all.
+    """
+
+    def test_empty_retries_multi_leg_default_is_zero(self) -> None:
+        from fli.search.flights import SearchFlights
+
+        assert SearchFlights._EMPTY_RETRIES_MULTI_LEG == 0
+
+    def test_multi_leg_multi_city_qualifies_for_retry(self) -> None:
+        """MULTI_CITY trip type qualifies for application-level retry.
+
+        Multi-leg queries are eligible for the empty-body retry when
+        ``_EMPTY_RETRIES_MULTI_LEG > 0``.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from fli.models import Airport, FlightSearchFilters, FlightSegment, PassengerInfo
+        from fli.models.google_flights.base import TripType
+        from fli.search.flights import SearchFlights
+
+        today = datetime.now()
+
+        def d(i: int) -> str:
+            return (today + timedelta(days=30 + i * 3)).strftime("%Y-%m-%d")
+
+        filters = FlightSearchFilters(
+            trip_type=TripType.MULTI_CITY,
+            passenger_info=PassengerInfo(adults=1),
+            flight_segments=[
+                FlightSegment(
+                    departure_airport=[[Airport.JFK, 0]],
+                    arrival_airport=[[Airport.LHR, 0]],
+                    travel_date=d(0),
+                ),
+                FlightSegment(
+                    departure_airport=[[Airport.LHR, 0]],
+                    arrival_airport=[[Airport.CDG, 0]],
+                    travel_date=d(1),
+                ),
+            ],
+        )
+
+        sf = SearchFlights()
+        empty_resp = MagicMock()
+        empty_resp.text = ""
+        warm_payload = ")]}'\n" + '[[null, null, "[null, null, null, null]"]]'
+        warm_resp = MagicMock()
+        warm_resp.text = warm_payload
+
+        with (
+            patch.object(SearchFlights, "_EMPTY_RETRIES_MULTI_LEG", 1),
+            patch.object(sf.client, "post", side_effect=[empty_resp, warm_resp]) as mock_post,
+        ):
+            result = sf._do_single_search(filters)
+
+        # With 1 retry enabled, two POST calls must have been made.
+        assert mock_post.call_count == 2
+        assert result == []
+
+    def test_whitespace_only_body_treated_as_empty(self) -> None:
+        """A response body of only whitespace must be treated as empty (no payload)."""
+        from unittest.mock import MagicMock, patch
+
+        from fli.models import Airport, FlightSearchFilters, FlightSegment, PassengerInfo
+        from fli.models.google_flights.base import TripType
+        from fli.search.flights import SearchFlights
+
+        today = datetime.now()
+        d1 = (today + timedelta(days=30)).strftime("%Y-%m-%d")
+        d2 = (today + timedelta(days=37)).strftime("%Y-%m-%d")
+        filters = FlightSearchFilters(
+            trip_type=TripType.ROUND_TRIP,
+            passenger_info=PassengerInfo(adults=1),
+            flight_segments=[
+                FlightSegment(
+                    departure_airport=[[Airport.JFK, 0]],
+                    arrival_airport=[[Airport.LHR, 0]],
+                    travel_date=d1,
+                ),
+                FlightSegment(
+                    departure_airport=[[Airport.LHR, 0]],
+                    arrival_airport=[[Airport.JFK, 0]],
+                    travel_date=d2,
+                ),
+            ],
+        )
+
+        sf = SearchFlights()
+        whitespace_resp = MagicMock()
+        whitespace_resp.text = "   \n\t  "
+
+        with patch.object(sf.client, "post", return_value=whitespace_resp):
+            result = sf._do_single_search(filters)
+
+        assert result is None
+
+    def test_parseable_empty_inner_payload_returns_none(self) -> None:
+        """A response where ``[0][2]`` is falsy/empty must return None (not crash)."""
+        from unittest.mock import MagicMock, patch
+
+        from fli.models import Airport, FlightSearchFilters, FlightSegment, PassengerInfo
+        from fli.models.google_flights.base import TripType
+        from fli.search.flights import SearchFlights
+
+        today = datetime.now()
+        d = (today + timedelta(days=30)).strftime("%Y-%m-%d")
+        filters = FlightSearchFilters(
+            trip_type=TripType.ONE_WAY,
+            passenger_info=PassengerInfo(adults=1),
+            flight_segments=[
+                FlightSegment(
+                    departure_airport=[[Airport.JFK, 0]],
+                    arrival_airport=[[Airport.LHR, 0]],
+                    travel_date=d,
+                ),
+            ],
+        )
+
+        sf = SearchFlights()
+        # Outer envelope is valid JSON, but ``[0][2]`` is None/empty.
+        empty_inner_resp = MagicMock()
+        empty_inner_resp.text = ")]}'\n[[null, null, null]]"
+
+        with patch.object(sf.client, "post", return_value=empty_inner_resp):
+            result = sf._do_single_search(filters)
+
+        assert result is None
