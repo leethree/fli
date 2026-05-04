@@ -7,6 +7,7 @@ with Google Flights' API to find available flights and their details.
 import json
 from copy import deepcopy
 from datetime import datetime
+from typing import Any
 
 from curl_cffi.requests.exceptions import Timeout
 
@@ -60,7 +61,11 @@ class SearchFlights:
     _EMPTY_RETRIES_MULTI_LEG = 0
 
     def _do_single_search(
-        self, filters: FlightSearchFilters, *, include_metadata: bool = False
+        self,
+        filters: FlightSearchFilters,
+        *,
+        include_metadata: bool = False,
+        timeout: int | None = None,
     ) -> list[FlightResult] | tuple[list[FlightResult], dict] | None:
         """Execute a single API call and return flight options for the current unselected leg.
 
@@ -68,6 +73,12 @@ class SearchFlights:
             filters: Full flight search object including airports, dates, and preferences
             include_metadata: If True, return (flights, metadata) with response-level
                 data such as price_range.
+            timeout: Per-attempt HTTP timeout in seconds.  ``None`` (the
+                default) defers to ``Client.DEFAULT_TIMEOUT``, which is
+                tuned for the MCP transport budget.  Non-MCP callers
+                (notably ``SearchFlights.search``) override this with
+                ``SEARCH_REQUEST_TIMEOUT`` to allow longer waits on
+                live-API queries.
 
         Returns:
             List of FlightResult, or (flights, metadata) tuple, or None if no results
@@ -80,14 +91,18 @@ class SearchFlights:
         max_attempts = 1 + (self._EMPTY_RETRIES_MULTI_LEG if is_multi_leg else 0)
 
         encoded_filters = filters.encode()
+        post_kwargs: dict[str, Any] = {
+            "url": self.BASE_URL,
+            "data": f"f.req={encoded_filters}",
+            "impersonate": "chrome",
+            "allow_redirects": True,
+        }
+        if timeout is not None:
+            post_kwargs["timeout"] = timeout
+
         decoded = None
         for attempt in range(max_attempts):
-            response = self.client.post(
-                url=self.BASE_URL,
-                data=f"f.req={encoded_filters}",
-                impersonate="chrome",
-                allow_redirects=True,
-            )
+            response = self.client.post(**post_kwargs)
             # No raise_for_status() here: ``Client.post`` already calls it
             # internally and re-wraps any non-2xx as an Exception, so a
             # response that reaches us is always 2xx.
@@ -155,31 +170,17 @@ class SearchFlights:
             endpoint reliably supports one-way and round-trip searches.
 
         """
-        encoded_filters = filters.encode()
-
         try:
-            response = self.client.post(
-                url=self.BASE_URL,
-                data=f"f.req={encoded_filters}",
-                impersonate="chrome",
-                allow_redirects=True,
-                timeout=self.SEARCH_REQUEST_TIMEOUT,
-            )
-            # No raise_for_status() here: ``Client.post`` already calls it
-            # internally.
-
-            parsed = json.loads(response.text.lstrip(")]}'"))[0][2]
-            if not parsed:
+            # Delegate to the hardened single-call helper instead of
+            # reimplementing post+parse here.  ``_do_single_search``
+            # owns the empty-body guard (no ``json.loads('')``
+            # explosion on truly-empty responses), the optional
+            # retry-on-empty for multi-leg, and consistent type
+            # propagation up to ``Client.post``.  Pre this refactor,
+            # the recursive ``search`` path bypassed all of those.
+            flights = self._do_single_search(filters, timeout=self.SEARCH_REQUEST_TIMEOUT)
+            if flights is None:
                 return None
-
-            encoded_filters = json.loads(parsed)
-            flights_data = [
-                item
-                for i in [2, 3]
-                if isinstance(encoded_filters[i], list)
-                for item in encoded_filters[i][0]
-            ]
-            flights = [self._parse_flights_data(flight) for flight in flights_data]
 
             if filters.trip_type == TripType.ONE_WAY:
                 return flights

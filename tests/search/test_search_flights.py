@@ -520,7 +520,10 @@ class TestRecursionTimeoutPolicy:
         return resp
 
     def _drive_recursion(
-        self, *, num_continuations: int, continuation_outcomes: list,
+        self,
+        *,
+        num_continuations: int,
+        continuation_outcomes: list,
     ):
         """Drive ``SearchFlights.search`` end-to-end without any live HTTP.
 
