@@ -36,6 +36,14 @@ class SearchDates:
         "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
     }
     MAX_DAYS_PER_SEARCH = 61
+    # The calendar endpoint is heavier than the per-day shopping endpoint
+    # (it returns up to ~305 days of price data per call) and routinely
+    # takes 30-50 s to compute even on warm cache.  ``Client``'s default
+    # 25 s budget — sized for MCP transport — is too tight here, so the
+    # date search opts into a longer per-attempt budget.  Date searches
+    # are typically not latency-sensitive in the same way (the user has
+    # explicitly asked for a date-range scan).
+    REQUEST_TIMEOUT = 60
 
     def __init__(self):
         """Initialize the search client for date-based searches."""
@@ -121,6 +129,7 @@ class SearchDates:
                 data=f"f.req={encoded_filters}",
                 impersonate="chrome",
                 allow_redirects=True,
+                timeout=self.REQUEST_TIMEOUT,
             )
             response.raise_for_status()
             parsed = json.loads(response.text.lstrip(")]}'"))[0][2]

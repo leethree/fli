@@ -5,6 +5,7 @@ functionality, enabling AI assistants to search for flights and find cheapest
 travel dates.
 """
 
+import hashlib
 import json
 import os
 from copy import deepcopy
@@ -12,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from fli.core import (
@@ -100,6 +101,36 @@ _DESTINATION_FIELD_DESCRIPTION = (
 )
 
 
+def _coerce_json_list_string(value: Any) -> Any:
+    """Pre-validation hook: unwrap a JSON-encoded list passed as a string.
+
+    Some MCP transports / agent setups serialize array tool arguments as
+    JSON strings before they reach the server (the LLM emits
+    ``["CZ","BA"]`` and the transport encodes it once more, so the tool
+    receives the literal string ``'["CZ", "BA"]'``).  Pydantic then
+    rejects with ``Input should be a valid list``, which made the
+    ``airlines=`` filter unusable from those clients (Issue C in the
+    2026-05-03 BUGREPORT).
+
+    The fix is intentionally conservative — only acts on strings whose
+    stripped form looks like a JSON array (``[...]``) and only when JSON
+    parsing yields a list.  Anything else (a bare IATA code, a metro
+    code like ``"LON"``, ``None``, an actual list) flows through
+    unchanged so legitimate single-string inputs to the
+    ``str | list[str]`` union types aren't disturbed.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                return value
+            if isinstance(parsed, list):
+                return parsed
+    return value
+
+
 class FlightSearchParams(BaseModel):
     """Parameters for searching flights on a specific date."""
 
@@ -143,6 +174,16 @@ class FlightSearchParams(BaseModel):
         True, description="Return all available results instead of curated ~30"
     )
 
+    # See ``_coerce_json_list_string`` for why this hook exists — some
+    # MCP transports re-encode list arguments as JSON strings before
+    # they reach Pydantic.  Apply to every list-typed field on this
+    # model so the same fix covers ``airlines`` (Issue C in the
+    # BUGREPORT) and the ``origin`` / ``destination`` union types (same
+    # transport bug, just hadn't been hit yet).
+    _coerce_lists = field_validator("origin", "destination", "airlines", mode="before")(
+        _coerce_json_list_string
+    )
+
 
 class MultiCityLeg(BaseModel):
     """A single leg of a multi-city itinerary."""
@@ -150,6 +191,10 @@ class MultiCityLeg(BaseModel):
     origin: str | list[str] = Field(description=_ORIGIN_FIELD_DESCRIPTION)
     destination: str | list[str] = Field(description=_DESTINATION_FIELD_DESCRIPTION)
     date: str = Field(description="Travel date in YYYY-MM-DD format")
+
+    _coerce_lists = field_validator("origin", "destination", mode="before")(
+        _coerce_json_list_string
+    )
 
 
 class MultiCitySearchParams(BaseModel):
@@ -193,6 +238,10 @@ class MultiCitySearchParams(BaseModel):
         True, description="Return all available results instead of curated ~30"
     )
 
+    # ``legs`` is also list-shaped and shows the same transport-encoding
+    # symptom — covered here so the same fix protects both.
+    _coerce_lists = field_validator("legs", "airlines", mode="before")(_coerce_json_list_string)
+
 
 class DateSearchParams(BaseModel):
     """Parameters for finding the cheapest travel dates within a range."""
@@ -223,6 +272,10 @@ class DateSearchParams(BaseModel):
         CONFIG.default_passengers,
         ge=1,
         description="Number of adult passengers",
+    )
+
+    _coerce_lists = field_validator("origin", "destination", "airlines", mode="before")(
+        _coerce_json_list_string
     )
 
 
@@ -278,6 +331,41 @@ def _serialize_flight_result(flight: Any, is_round_trip: bool = False) -> dict[s
     }
 
 
+def _normalize_flight_prices(
+    flight_results: list[dict[str, Any]],
+    sort_by: Any = None,
+) -> list[dict[str, Any]]:
+    """Tag price-unavailable entries and ensure they don't pollute CHEAPEST sort.
+
+    Google Flights occasionally returns options with no displayable price
+    (parsed as ``0.0`` upstream).  Previously these were rewritten to
+    ``price: null`` and left interleaved with priced results — meaning a
+    CHEAPEST sort surfaced a None-priced option as the "top" hit (which
+    mis-suggests "no usable options" when in fact priced alternatives exist
+    further down the list).  We now:
+
+    1. Set ``price`` to ``None`` and add an explicit ``price_unavailable:
+       True`` flag so callers can branch on it.
+    2. When ``sort_by`` is CHEAPEST, push price-unavailable entries to the
+       end so the first option the LLM sees is always actionable.
+    """
+    for fr in flight_results:
+        price = fr.get("price")
+        if price is None or price == 0:
+            fr["price"] = None
+            fr["price_unavailable"] = True
+        else:
+            fr["price_unavailable"] = False
+
+    sort_name = getattr(sort_by, "name", None)
+    if sort_name == "CHEAPEST":
+        # Stable sort: priced entries keep their server-side order; unpriced
+        # entries get pushed to the bottom in original order.
+        flight_results.sort(key=lambda fr: 1 if fr.get("price_unavailable") else 0)
+
+    return flight_results
+
+
 def _serialize_date_result(date_result: Any) -> dict[str, Any]:
     """Serialize a date price result to a dictionary."""
     return {
@@ -291,6 +379,52 @@ def _serialize_date_result(date_result: Any) -> dict[str, Any]:
 # =============================================================================
 # Search Execution
 # =============================================================================
+
+
+def _classify_search_error(exc: Exception) -> dict[str, Any]:
+    """Classify a search exception so callers can distinguish failure modes.
+
+    Distinguishes a true zero-result response from a network/API failure.
+    Without this, a 30-60s timeout against Google Flights and a search that
+    legitimately returns zero options both surface to the LLM as
+    ``flights:[]``, which is easy to misread as "the requested itinerary is
+    impossible" when in fact a retry might succeed.  This is especially
+    important for multi-city searches: Google's continuation endpoint
+    (``GetShoppingResults`` with ``selected_flight`` set) is intermittently
+    slow, and a transient timeout should not be reported the same way as
+    "no airline files this routing".
+    """
+    msg = str(exc)
+    lower = msg.lower()
+    # curl-cffi surfaces a CURLE_OPERATION_TIMEDOUT (curl error 28) as a
+    # ``Timeout`` exception whose message contains "timed out".  Both the
+    # canonical phrase and the curl error number are checked because the
+    # exception is re-wrapped by ``Client.post`` into a generic ``Exception``.
+    is_timeout = "timed out" in lower or "curl: (28)" in lower
+    if is_timeout:
+        return {
+            "success": False,
+            "error_kind": "timeout",
+            "error": (
+                "Google Flights API timed out. Multi-city continuation calls"
+                " (when previous legs are selected) are intermittently slow."
+                " Retry the same request — this is not a 'no flights' result."
+            ),
+            "flights": [],
+        }
+    if "validation error" in lower:
+        return {
+            "success": False,
+            "error_kind": "validation",
+            "error": "Invalid parameter value",
+            "flights": [],
+        }
+    return {
+        "success": False,
+        "error_kind": "unknown",
+        "error": f"Search failed: {msg}",
+        "flights": [],
+    }
 
 
 def _execute_flight_search(params: FlightSearchParams) -> dict[str, Any]:
@@ -348,6 +482,7 @@ def _execute_flight_search(params: FlightSearchParams) -> dict[str, Any]:
         # Serialize results
         is_round_trip = trip_type == TripType.ROUND_TRIP
         flight_results = [_serialize_flight_result(f, is_round_trip) for f in flights]
+        flight_results = _normalize_flight_prices(flight_results, sort_by=sort_by)
 
         if CONFIG.max_results:
             flight_results = flight_results[: CONFIG.max_results]
@@ -360,12 +495,9 @@ def _execute_flight_search(params: FlightSearchParams) -> dict[str, Any]:
         }
 
     except ParseError as e:
-        return {"success": False, "error": str(e), "flights": []}
+        return {"success": False, "error_kind": "parse", "error": str(e), "flights": []}
     except Exception as e:
-        error_msg = str(e)
-        if "validation error" in error_msg.lower():
-            return {"success": False, "error": "Invalid parameter value", "flights": []}
-        return {"success": False, "error": f"Search failed: {error_msg}", "flights": []}
+        return _classify_search_error(e)
 
 
 def _execute_date_search(params: DateSearchParams) -> dict[str, Any]:
@@ -437,16 +569,27 @@ def _execute_date_search(params: DateSearchParams) -> dict[str, Any]:
         }
 
     except ParseError as e:
-        return {"success": False, "error": str(e), "dates": []}
+        return {"success": False, "error_kind": "parse", "error": str(e), "dates": []}
     except Exception as e:
-        return {"success": False, "error": f"Search failed: {str(e)}", "dates": []}
+        # Reuse the same classifier; swap the empty key from ``flights`` to
+        # ``dates`` so the response shape stays consistent for date searches.
+        resp = _classify_search_error(e)
+        resp["dates"] = resp.pop("flights", [])
+        return resp
 
 
 # =============================================================================
 # Multi-City Search (stateful, one API call per step)
 # =============================================================================
 
-_search_sessions: dict[str, tuple[Any, list[Any]]] = {}
+# Session value: ``(filters, last_results, degraded)`` where ``degraded`` is
+# True iff a previous step in this session had to fall back to per-leg
+# pricing because Google's multi-city curator returned empty / unpriced.
+# Once a trip's curator is known broken, every subsequent leg skips the
+# multi-city call entirely and goes straight to the one-way fallback —
+# this turns a 4-leg degraded trip from ~8 minutes of futile retries into
+# ~12 seconds total.
+_search_sessions: dict[str, tuple[Any, list[Any], bool]] = {}
 
 
 def _format_endpoint(value: str | list[str]) -> str:
@@ -462,10 +605,86 @@ def _canonical_endpoint(value: str | list[str]) -> str:
 
 
 def _session_key(legs: list[MultiCityLeg]) -> str:
+    """Routes-and-dates portion of the session cache key.
+
+    Public-ish helper: stable across equivalent endpoint forms (metro
+    code vs. expanded list, whitespace, case) so callers can use it for
+    canonicalization checks.  Note that the actual cache key used by
+    ``_execute_multi_city_step`` also folds in filter params — see
+    ``_session_cache_key``.
+    """
     return "|".join(
         f"{_canonical_endpoint(leg.origin)}-{_canonical_endpoint(leg.destination)}-{leg.date}"
         for leg in legs
     )
+
+
+def _session_cache_key(params: MultiCitySearchParams) -> str:
+    """Full cache key for a multi-city session — legs *and* filter params.
+
+    Without folding the filters in, a continuation call that reformulated
+    any of cabin_class / max_stops / sort_by / airlines / departure_window
+    / exclude_basic_economy / emissions / checked_bags / carry_on /
+    show_all_results / passengers would silently hit the cached session
+    keyed only on routes+dates and execute with the *original* filters,
+    with no error or warning.  By including a stable hash of the filter
+    fields, a reformulated call misses the cache and starts a fresh
+    session instead — agent-visible behaviour matches the agent's intent.
+    """
+    legs_part = _session_key(params.legs)
+    filter_fields = (
+        params.cabin_class,
+        params.max_stops,
+        params.sort_by,
+        tuple(sorted(params.airlines)) if params.airlines else None,
+        params.departure_window,
+        params.exclude_basic_economy,
+        params.emissions,
+        params.checked_bags,
+        params.carry_on,
+        params.show_all_results,
+        params.passengers,
+    )
+    # blake2b with a short digest is plenty for collision-avoidance in an
+    # in-memory dict; we're not using this for security.
+    digest = hashlib.blake2b(repr(filter_fields).encode(), digest_size=8).hexdigest()
+    return f"{legs_part}|{digest}"
+
+
+def _build_per_leg_fallback_filters(
+    filters: FlightSearchFilters,
+    current_step: int,
+) -> FlightSearchFilters:
+    """Build a one-way filter for a single leg of a multi-city itinerary.
+
+    Used when Google's multi-city curator returns empty or only-unpriced
+    options — common on 4+-leg itineraries where the curator appears to
+    restrict candidates to single-carrier or alliance bundles, dropping
+    carriers that price fine standalone (e.g., CZ on a routing where
+    Star Alliance carriers cover every city).  The fallback surfaces the
+    same options the one-way ``search_flights`` path returns, at the
+    cost of a combined trip price.
+    """
+    current_segment = deepcopy(filters.flight_segments[current_step])
+    current_segment.selected_flight = None
+    return FlightSearchFilters(
+        trip_type=TripType.ONE_WAY,
+        passenger_info=filters.passenger_info,
+        flight_segments=[current_segment],
+        stops=filters.stops,
+        seat_type=filters.seat_type,
+        airlines=filters.airlines,
+        sort_by=filters.sort_by,
+        exclude_basic_economy=filters.exclude_basic_economy,
+        emissions=filters.emissions,
+        bags=filters.bags,
+        show_all_results=filters.show_all_results,
+    )
+
+
+def _all_unpriced(raw: list[Any]) -> bool:
+    """Check whether every parsed FlightResult in *raw* lacks a usable price."""
+    return all((getattr(r, "price", 0) or 0) == 0 for r in raw)
 
 
 def _execute_multi_city_step(
@@ -476,7 +695,7 @@ def _execute_multi_city_step(
     key: str | None = None
 
     try:
-        key = _session_key(params.legs)
+        key = _session_cache_key(params)
         cached = _search_sessions.get(key)
 
         if cached is None or selection is None:
@@ -523,13 +742,21 @@ def _execute_multi_city_step(
                 show_all_results=params.show_all_results,
             )
             current_step = 0
+            degraded = False
         else:
-            filters, last_results = cached
+            # Session value is a 3-tuple ``(filters, last_results, degraded)``
+            # — the third element is set by an earlier step that fell back to
+            # per-leg pricing because Google's multi-city curator was broken.
+            filters, last_results, degraded = cached
             current_step = sum(1 for s in filters.flight_segments if s.selected_flight is not None)
 
             if selection < 0 or selection >= len(last_results):
                 return {
                     "success": False,
+                    # Match the rest of this handler's contract: every other
+                    # error return now carries error_kind so callers can
+                    # branch without string-matching the message.
+                    "error_kind": "validation",
                     "error": (
                         f"Selection index {selection} out of range"
                         f" (valid: 0-{len(last_results) - 1})"
@@ -541,34 +768,107 @@ def _execute_multi_city_step(
             filters.flight_segments[current_step].selected_flight = last_results[selection]
             current_step += 1
 
+        # Snapshot of the entry value: lets us differentiate "this step
+        # discovered the curator is broken" from "the session was already
+        # known broken" when crafting the user-facing message later.
+        already_degraded_on_entry = degraded
+
         search_client = SearchFlights()
-        result = search_client._do_single_search(filters, include_metadata=True)
-        if result is None:
+        # Skip the multi-city call entirely when the session is already
+        # known degraded — re-issuing it would just burn another ~2 minutes
+        # against a curator that's already proved unable to price the
+        # remaining legs.  Drop straight to the per-leg fallback below.
+        if degraded:
             raw, metadata = [], {}
         else:
-            raw, metadata = result
+            result = search_client._do_single_search(filters, include_metadata=True)
+            if result is None:
+                raw, metadata = [], {}
+            else:
+                raw, metadata = result
 
         num_legs = len(params.legs)
         is_final = current_step >= num_legs - 1
 
+        # Per-leg fallback: when Google's multi-city curator returns empty
+        # or only-unpriced options for this leg (common on 4+-leg trips
+        # where the curator restricts to single-carrier/alliance bundles),
+        # re-run as a standalone one-way query for the current leg.  We
+        # lose the combined trip price but surface options the user can
+        # actually pick — see the bug report where CZ disappeared from a
+        # 4-leg LGW↔China itinerary even though every leg priced fine via
+        # ``search_flights``.  When ``degraded`` is True we always enter
+        # this branch (because raw is forced to []), so the same code path
+        # serves both the first-time-degraded and continued-degraded cases.
+        fallback_used = False
+        if not raw or _all_unpriced(raw):
+            fallback_filters = _build_per_leg_fallback_filters(filters, current_step)
+            fb_result = search_client._do_single_search(
+                fallback_filters,
+                include_metadata=True,
+            )
+            if fb_result is not None:
+                fb_raw, _ = fb_result
+                # Only switch to the fallback if it actually surfaced priced
+                # options; an empty/all-unpriced fallback is no improvement
+                # over what we already have.
+                if fb_raw and not _all_unpriced(fb_raw):
+                    raw = fb_raw
+                    metadata = {}  # multi-city price_range no longer applies
+                    fallback_used = True
+
+        # Once any leg in this trip falls back, every subsequent leg should
+        # skip the (broken) multi-city call.  Persist the flag through the
+        # session so continuation steps inherit it.
+        degraded = degraded or fallback_used
+
         if not raw:
-            _search_sessions.pop(key, None)
-            return {
+            # Multi-city queries against ``GetShoppingResults`` regularly
+            # return HTTP 200 + empty body on cold cache (~60 s server-side
+            # timeout).  fli already retries empty multi-leg responses once
+            # at the API layer; if we still ended up empty (and the per-leg
+            # fallback also turned up nothing) the agent should know it's
+            # likely transient and retry the same MCP call rather than
+            # concluding the routing is impossible.  Keep the session so
+            # the retry resumes from the same step (and so the degraded
+            # flag, if set on a prior step, persists for the retry).
+            empty_resp: dict[str, Any] = {
                 "success": True,
                 "flights": [],
                 "count": 0,
                 "step": current_step + 1,
                 "total_legs": num_legs,
                 "is_final": is_final,
+                "hint": (
+                    "Empty result on a multi-city leg often means Google's"
+                    " backend timed out warming a cold cache. Retry the"
+                    " same call (without changing parameters) once or twice"
+                    " — empirically a 4-leg query may need 2-4 attempts"
+                    " before the warm path returns flights."
+                ),
             }
+            if degraded:
+                empty_resp["combined_pricing"] = False
+            # Preserve the existing session (with its degraded flag, if
+            # any) so the next retry resumes from the same step.
+            return empty_resp
 
-        _search_sessions[key] = (filters, raw)
+        _search_sessions[key] = (filters, raw, degraded)
 
         flight_results = [_serialize_flight_result(f, is_round_trip=False) for f in raw]
+        flight_results = _normalize_flight_prices(
+            flight_results,
+            sort_by=filters.sort_by,
+        )
 
-        for fr in flight_results:
-            if fr.get("price") == 0:
-                fr["price"] = None
+        # ``degraded`` is sticky across the whole session: once any leg
+        # served per-leg pricing, every leg in this trip is per-leg too.
+        # Use it (not the per-step ``fallback_used``) for the response
+        # signals so the agent can't accidentally treat a later step's
+        # multi-city-shaped numbers as a combined trip price.
+        if degraded:
+            for fr in flight_results:
+                fr["per_leg_price"] = True
 
         if CONFIG.max_results:
             flight_results = flight_results[: CONFIG.max_results]
@@ -588,13 +888,46 @@ def _execute_multi_city_step(
                 f" ({params.legs[current_step].date})"
             ),
             "is_final": is_final,
+            "combined_pricing": not degraded,
         }
 
         price_range = metadata.get("price_range")
         if price_range and len(price_range) >= 2:
             resp["price_range"] = {"min": price_range[0], "max": price_range[1]}
 
-        if is_final:
+        if degraded:
+            # Differentiate first-time-degraded from carry-over so the
+            # agent can tell whether *this* leg failed the curator or
+            # whether a prior leg already did.  ``fallback_used`` tells us
+            # whether we ran the fallback this step, but it's also True on
+            # carry-over steps (because we always run the fallback when
+            # degraded).  The clean distinction is ``already_degraded_on_entry``.
+            if not already_degraded_on_entry:
+                lead_in = (
+                    f"Google's multi-city pricing was unavailable for"
+                    f" leg {current_step + 1} of {num_legs} — common on"
+                    " 4+-leg itineraries where the curator restricts to"
+                    " single-carrier bundles. Showing per-leg standalone"
+                    " prices instead;"
+                )
+            else:
+                lead_in = (
+                    f"Continuing in per-leg pricing mode (the multi-city"
+                    f" curator failed earlier in this trip). Leg"
+                    f" {current_step + 1} of {num_legs} is shown at"
+                    " standalone prices;"
+                )
+            resp["message"] = (
+                f"{lead_in} the combined trip total won't be available, so"
+                " sum the individual leg prices to estimate the trip cost."
+                + (
+                    f" Pick a flight by index (0-{len(flight_results) - 1})"
+                    " and call again with selection=<index>."
+                    if not is_final
+                    else ""
+                )
+            )
+        elif is_final:
             resp["message"] = (
                 f"Showing options for leg {current_step + 1} of"
                 f" {num_legs}. These are the final results."
@@ -613,13 +946,16 @@ def _execute_multi_city_step(
 
     except ParseError as e:
         _search_sessions.pop(key, None)
-        return {"success": False, "error": str(e), "flights": []}
+        return {"success": False, "error_kind": "parse", "error": str(e), "flights": []}
     except Exception as e:
-        _search_sessions.pop(key, None)
-        error_msg = str(e)
-        if "validation error" in error_msg.lower():
-            return {"success": False, "error": "Invalid parameter value", "flights": []}
-        return {"success": False, "error": f"Search failed: {error_msg}", "flights": []}
+        # Only discard the cached session on non-recoverable errors.  A
+        # transient timeout on, say, the leg-3 continuation call should
+        # *not* force the user to start over from leg 1 — keep the cached
+        # filters + last_results so the next ``selection`` resumes cleanly.
+        result = _classify_search_error(e)
+        if result.get("error_kind") != "timeout":
+            _search_sessions.pop(key, None)
+        return result
 
 
 # =============================================================================
@@ -797,8 +1133,14 @@ def _search_dates_from_params(params: DateSearchParams) -> dict[str, Any]:
 @mcp.tool(
     annotations={
         "title": "Search Multi-City Flights",
-        "readOnlyHint": True,
-        "idempotentHint": True,
+        # search_multi_city is *stateful*: every successful continuation
+        # call mutates the in-memory ``_search_sessions`` cache to advance
+        # the leg pointer.  Marking it readOnly would mislead MCP clients
+        # into caching or auto-invoking it without confirmation; marking
+        # it idempotent would let a transport-layer retry advance the
+        # session past the leg the agent intended to select.
+        "readOnlyHint": False,
+        "idempotentHint": False,
     },
 )
 def search_multi_city(

@@ -7,6 +7,9 @@ with Google Flights' API to find available flights and their details.
 import json
 from copy import deepcopy
 from datetime import datetime
+from typing import Any
+
+from curl_cffi.requests.exceptions import Timeout
 
 from fli.core import extract_currency_from_price_token
 from fli.models import (
@@ -31,13 +34,38 @@ class SearchFlights:
     DEFAULT_HEADERS = {
         "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
     }
+    # ``search`` (the recursive entry point used by the CLI and direct
+    # Python callers) opts into a longer per-attempt timeout than
+    # ``Client.DEFAULT_TIMEOUT`` (25 s).  The 25 s default is sized for
+    # the MCP transport's request budget; CLI users routinely tolerate
+    # 30-60 s for complex multi-city expansions and the live-API tests
+    # in particular need headroom for network jitter on JFK/LAX-class
+    # routes.  The MCP path uses ``_do_single_search`` directly and
+    # keeps the tight default.
+    SEARCH_REQUEST_TIMEOUT = 60
 
     def __init__(self):
         """Initialize the search client for flight searches."""
         self.client = get_client()
 
+    # Application-layer retry-on-empty for multi-leg queries.  Was 1
+    # (one extra attempt) but disabled because the doubled wall-time it
+    # produced on cold-cache empties (~2× ``Client.DEFAULT_TIMEOUT``)
+    # routinely exceeded MCP client transport budgets.  The MCP layer
+    # surfaces an explicit "empty likely transient — retry the same
+    # call" hint instead, which gives each retry a fresh transport
+    # budget; that's strictly better than soaking the budget on a
+    # single attempt's retry loop.  Kept as a constant so a caller
+    # outside MCP (e.g. the CLI, where the budget is the user's
+    # patience) can override it.
+    _EMPTY_RETRIES_MULTI_LEG = 0
+
     def _do_single_search(
-        self, filters: FlightSearchFilters, *, include_metadata: bool = False
+        self,
+        filters: FlightSearchFilters,
+        *,
+        include_metadata: bool = False,
+        timeout: int | None = None,
     ) -> list[FlightResult] | tuple[list[FlightResult], dict] | None:
         """Execute a single API call and return flight options for the current unselected leg.
 
@@ -45,23 +73,64 @@ class SearchFlights:
             filters: Full flight search object including airports, dates, and preferences
             include_metadata: If True, return (flights, metadata) with response-level
                 data such as price_range.
+            timeout: Per-attempt HTTP timeout in seconds.  ``None`` (the
+                default) defers to ``Client.DEFAULT_TIMEOUT``, which is
+                tuned for the MCP transport budget.  Non-MCP callers
+                (notably ``SearchFlights.search``) override this with
+                ``SEARCH_REQUEST_TIMEOUT`` to allow longer waits on
+                live-API queries.
 
         Returns:
             List of FlightResult, or (flights, metadata) tuple, or None if no results
 
         """
+        # Multi-leg queries (round-trip and multi-city) hit a notably flakier
+        # path on Google's backend.  One-way queries are reliable enough that
+        # a retry just slows them down on legitimate "no flights" results.
+        is_multi_leg = filters.trip_type != TripType.ONE_WAY
+        max_attempts = 1 + (self._EMPTY_RETRIES_MULTI_LEG if is_multi_leg else 0)
+
         encoded_filters = filters.encode()
-        response = self.client.post(
-            url=self.BASE_URL,
-            data=f"f.req={encoded_filters}",
-            impersonate="chrome",
-            allow_redirects=True,
-        )
-        response.raise_for_status()
-        parsed = json.loads(response.text.lstrip(")]}'"))[0][2]
-        if not parsed:
+        post_kwargs: dict[str, Any] = {
+            "url": self.BASE_URL,
+            "data": f"f.req={encoded_filters}",
+            "impersonate": "chrome",
+            "allow_redirects": True,
+        }
+        if timeout is not None:
+            post_kwargs["timeout"] = timeout
+
+        decoded = None
+        for attempt in range(max_attempts):
+            response = self.client.post(**post_kwargs)
+            # No raise_for_status() here: ``Client.post`` already calls it
+            # internally and re-wraps any non-2xx as an Exception, so a
+            # response that reaches us is always 2xx.
+
+            # Google's backend can time out and return either:
+            #   (a) an HTTP 200 with a truly empty body (or just the
+            #       anti-XSSI prefix), in which case ``json.loads('')``
+            #       would raise — guard before parsing.
+            #   (b) a parseable envelope where ``[0][2]`` is empty/None,
+            #       in which case ``parsed`` is falsy.
+            # Both are "empty body" for our purposes; both should retry on
+            # multi-leg.
+            payload = response.text.lstrip(")]}'").strip()
+            if not payload:
+                if attempt + 1 < max_attempts:
+                    continue
+                break
+            parsed = json.loads(payload)[0][2]
+            if parsed:
+                decoded = json.loads(parsed)
+                break
+            # Parseable envelope but empty inner payload — same retry rule.
+            if attempt + 1 < max_attempts:
+                continue
+
+        if decoded is None:
             return None
-        decoded = json.loads(parsed)
+
         flights_data = [
             item for i in [2, 3] if isinstance(decoded[i], list) for item in decoded[i][0]
         ]
@@ -101,29 +170,17 @@ class SearchFlights:
             endpoint reliably supports one-way and round-trip searches.
 
         """
-        encoded_filters = filters.encode()
-
         try:
-            response = self.client.post(
-                url=self.BASE_URL,
-                data=f"f.req={encoded_filters}",
-                impersonate="chrome",
-                allow_redirects=True,
-            )
-            response.raise_for_status()
-
-            parsed = json.loads(response.text.lstrip(")]}'"))[0][2]
-            if not parsed:
+            # Delegate to the hardened single-call helper instead of
+            # reimplementing post+parse here.  ``_do_single_search``
+            # owns the empty-body guard (no ``json.loads('')``
+            # explosion on truly-empty responses), the optional
+            # retry-on-empty for multi-leg, and consistent type
+            # propagation up to ``Client.post``.  Pre this refactor,
+            # the recursive ``search`` path bypassed all of those.
+            flights = self._do_single_search(filters, timeout=self.SEARCH_REQUEST_TIMEOUT)
+            if flights is None:
                 return None
-
-            encoded_filters = json.loads(parsed)
-            flights_data = [
-                item
-                for i in [2, 3]
-                if isinstance(encoded_filters[i], list)
-                for item in encoded_filters[i][0]
-            ]
-            flights = [self._parse_flights_data(flight) for flight in flights_data]
 
             if filters.trip_type == TripType.ONE_WAY:
                 return flights
@@ -139,12 +196,33 @@ class SearchFlights:
             if selected_count >= num_segments - 1:
                 return flights
 
-            # Select each flight option and fetch the next leg
+            # Select each flight option and fetch the next leg.
+            #
+            # Multi-city continuation calls hit Google Flights'
+            # ``GetShoppingResults`` endpoint with ``selected_flight`` set,
+            # which is intermittently slow.  Without per-iteration timeout
+            # handling, a single slow continuation kills the entire outer
+            # search — meaning a 4-leg trip with one flaky branch returns
+            # zero combos instead of the 4 that actually completed.  Treat
+            # timeouts as "this branch is unavailable right now" and keep
+            # whatever combos succeeded.  Non-timeout errors still bubble
+            # up so real bugs aren't swallowed.  Detection is by the
+            # concrete ``curl_cffi.Timeout`` type (and our own Timeout
+            # raised below for "all branches timed out") rather than
+            # string-matching on the exception message — string matching
+            # was fragile and depended on the now-removed outer wrapper.
             flight_combos = []
+            timeout_skipped = 0
+            total_continuations = 0
             for selected_flight in flights[:top_n]:
+                total_continuations += 1
                 next_filters = deepcopy(filters)
                 next_filters.flight_segments[selected_count].selected_flight = selected_flight
-                next_results = self.search(next_filters, top_n=top_n)
+                try:
+                    next_results = self.search(next_filters, top_n=top_n)
+                except Timeout:
+                    timeout_skipped += 1
+                    continue
                 if next_results is not None:
                     for next_result in next_results:
                         if isinstance(next_result, tuple):
@@ -152,10 +230,38 @@ class SearchFlights:
                         else:
                             flight_combos.append((selected_flight, next_result))
 
+            # Only surface a timeout when *every* continuation branch we
+            # attempted timed out (and produced nothing).  A mixed outcome
+            # — say one branch timed out and the other four returned
+            # legitimate "no onward flights" — is a real "no flights"
+            # result, not an API failure, and reporting it as a timeout
+            # would mislead the MCP layer into telling the agent to retry
+            # a query that's already shown its answer.
+            #
+            # Raise ``Timeout`` (the same type ``Client.post`` raises on
+            # a hung request) so an enclosing recursion frame and the
+            # MCP error classifier can both isinstance-check rather than
+            # parse the message.
+            if (
+                total_continuations > 0
+                and timeout_skipped == total_continuations
+                and not flight_combos
+            ):
+                raise Timeout(
+                    f"All {timeout_skipped} multi-city continuation calls"
+                    " timed out on the Google Flights API. Retry the search."
+                )
+
             return flight_combos
 
-        except Exception as e:
-            raise Exception(f"Search failed: {str(e)}") from e
+        # No outer wrapper: let the original exception type propagate so
+        # callers (notably the MCP error classifier) can branch on
+        # concrete types via ``isinstance`` instead of parsing the
+        # message.  The raise sites above (``Client.post`` for HTTP
+        # errors, ``Timeout`` for the all-branches-timed-out path) are
+        # already informative on their own.
+        except Exception:
+            raise
 
     @staticmethod
     def _parse_flights_data(data: list) -> FlightResult:
