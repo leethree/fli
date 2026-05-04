@@ -347,11 +347,11 @@ class TestMultiCityFallback:
         assert "hint" in result
         assert instance._do_single_search.call_count == 2
 
-    def test_fallback_filter_targets_current_leg(self):
-        """Use the current leg's airports/date for the fallback, not leg 0.
+    def test_fallback_filter_targets_current_leg_at_step_one(self):
+        """At step 1, the fallback's one-way segment must come from leg 0.
 
-        Without this guard a regression could re-fetch leg 0 every time
-        the multi-city call fails on a later leg.
+        Sanity coverage of the simple case before the more interesting
+        continuation-step test below.
         """
         with patch("fli.mcp.server.SearchFlights") as mock_cls:
             instance = mock_cls.return_value
@@ -370,13 +370,63 @@ class TestMultiCityFallback:
             assert len(ow_filters.flight_segments) == 1
             # Leg 0 of _four_leg_params is LGW -> SHA.  "SHA" is an IATA
             # metro code that expands to {PVG, SHA}, so the fallback should
-            # carry the same expanded airport set, not just one of them —
-            # this is also a guard that the fallback didn't accidentally
-            # re-fetch leg 1 (CTU/CAN airports).
+            # carry the same expanded airport set, not just one of them.
             ow_origin = {a[0].name for a in ow_filters.flight_segments[0].departure_airport}
             ow_destination = {a[0].name for a in ow_filters.flight_segments[0].arrival_airport}
             assert ow_origin == {"LGW"}
             assert ow_destination == {"PVG", "SHA"}
+
+    def test_fallback_filter_targets_current_leg_on_continuation(self):
+        """On a continuation step the fallback must use *that* leg's airports.
+
+        Regression guard: the previous version of this test only exercised
+        leg 0 (``selection=None``), so a code path that accidentally
+        re-fetched leg 0 every time the multi-city call failed on a
+        later leg would silently pass.  Drive the handler through to
+        step 2 with a successful step 1, then make the multi-city call
+        for step 2 fail and assert the fallback's one-way filter
+        carries leg 1's airports (SHA -> CTU), not leg 0's.
+        """
+        with patch("fli.mcp.server.SearchFlights") as mock_cls:
+            instance = mock_cls.return_value
+            instance._do_single_search.side_effect = [
+                # Step 1: multi-city succeeds with a priced leg-1 option.
+                ([_flight_result("CZ", "690", 421.0)], {}),
+                # Step 2: multi-city call empty → fallback fires.
+                None,
+                # Step 2: fallback returns priced one-way for leg 1 (SHA→CTU).
+                ([_flight_result("CZ", "3471", 75.0)], {}),
+            ]
+
+            params = _four_leg_params()
+            step1 = _execute_multi_city_step(params, selection=None)
+            assert step1["combined_pricing"] is True  # no fallback yet
+            assert step1["count"] == 1
+
+            step2 = _execute_multi_city_step(params, selection=0)
+            assert step2["combined_pricing"] is False  # fallback fired
+            assert step2["count"] == 1
+            assert step2["flights"][0]["per_leg_price"] is True
+
+            # Three calls total: 1 (step1 multi-city) + 2 (step2 multi-city + fallback).
+            assert instance._do_single_search.call_count == 3
+            fallback_filters = instance._do_single_search.call_args_list[2].args[0]
+            assert len(fallback_filters.flight_segments) == 1
+
+            # Leg 1 of _four_leg_params is SHA -> CTU (no metro expansion
+            # here — both are single airports in this fixture).  The
+            # fallback MUST target this leg, not leg 0 (LGW → SHA/PVG).
+            fb_origin = {a[0].name for a in fallback_filters.flight_segments[0].departure_airport}
+            fb_destination = {
+                a[0].name for a in fallback_filters.flight_segments[0].arrival_airport
+            }
+            assert fb_origin == {"PVG", "SHA"}, (
+                f"Fallback origin should match leg 1 (SHA metro = PVG+SHA), "
+                f"got {fb_origin}.  Regression: fallback re-targeted leg 0."
+            )
+            assert fb_destination == {"CTU"}, (
+                f"Fallback destination should match leg 1 (CTU), got {fb_destination}."
+            )
 
 
 # ---------------------------------------------------------------------------

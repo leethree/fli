@@ -563,3 +563,140 @@ class TestRecursionTimeoutPolicy:
         # The outer ``except Exception`` wrapper rebrands the message,
         # but the underlying "All N timed out" text must survive.
         assert "timed out" in str(exc_info.value).lower()
+
+
+class TestRetryPredicate:
+    """``Client.{get,post}`` retry only transient HTTP/network failures.
+
+    Without a ``retry=`` predicate, tenacity's default behaviour is to
+    retry every exception — which means a permanent 4xx response burns
+    three attempts × per-attempt latency on a request that will fail
+    identically each time, eating the MCP transport budget for no
+    benefit.  Regression test for the CodeRabbit review on
+    leethree/fli#2.
+    """
+
+    def test_4xx_response_is_not_retried(self) -> None:
+        """A 404-style HTTPError must propagate after a single attempt."""
+        from unittest.mock import MagicMock, patch
+
+        from curl_cffi.requests.exceptions import HTTPError
+
+        from fli.search.client import Client
+
+        # Build an HTTPError that looks like a 404 from raise_for_status.
+        resp_404 = MagicMock()
+        resp_404.status_code = 404
+        http_err = HTTPError("404 Not Found")
+        http_err.response = resp_404
+
+        c = Client()
+        with patch.object(
+            c._client, "post", side_effect=http_err
+        ) as mock_post:
+            with pytest.raises(HTTPError):
+                c.post("https://example.com")
+
+        # Permanent 4xx — single attempt, no retry.
+        assert mock_post.call_count == 1
+
+    def test_5xx_response_is_retried(self) -> None:
+        """A 503 should be retried (transient upstream failure)."""
+        from unittest.mock import MagicMock, patch
+
+        from curl_cffi.requests.exceptions import HTTPError
+
+        from fli.search.client import Client
+
+        resp_503 = MagicMock()
+        resp_503.status_code = 503
+        http_err = HTTPError("503 Service Unavailable")
+        http_err.response = resp_503
+
+        c = Client()
+        with patch.object(
+            c._client, "post", side_effect=http_err
+        ) as mock_post:
+            with pytest.raises(HTTPError):
+                c.post("https://example.com")
+
+        # Transient 5xx — tenacity should retry up to its attempt cap.
+        assert mock_post.call_count > 1
+
+    def test_429_response_is_retried(self) -> None:
+        """A 429 (Too Many Requests) is transient and worth a retry."""
+        from unittest.mock import MagicMock, patch
+
+        from curl_cffi.requests.exceptions import HTTPError
+
+        from fli.search.client import Client
+
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        http_err = HTTPError("429 Too Many Requests")
+        http_err.response = resp_429
+
+        c = Client()
+        with patch.object(
+            c._client, "post", side_effect=http_err
+        ) as mock_post:
+            with pytest.raises(HTTPError):
+                c.post("https://example.com")
+
+        assert mock_post.call_count > 1
+
+    def test_timeout_is_retried(self) -> None:
+        """``Timeout`` (curl error 28) is the canonical transient failure."""
+        from unittest.mock import patch
+
+        from curl_cffi.requests.exceptions import Timeout
+
+        from fli.search.client import Client
+
+        c = Client()
+        with patch.object(
+            c._client, "post", side_effect=Timeout("Operation timed out")
+        ) as mock_post:
+            with pytest.raises(Timeout):
+                c.post("https://example.com")
+
+        assert mock_post.call_count > 1
+
+    def test_non_request_exception_is_not_retried(self) -> None:
+        """Programming errors / value errors are not transient — no retry."""
+        from unittest.mock import patch
+
+        from fli.search.client import Client
+
+        c = Client()
+        with patch.object(
+            c._client, "post", side_effect=ValueError("bad arg")
+        ) as mock_post:
+            with pytest.raises(ValueError):
+                c.post("https://example.com")
+
+        # ValueError isn't an HTTP/network failure — single attempt only.
+        assert mock_post.call_count == 1
+
+    def test_original_exception_type_preserved(self) -> None:
+        """Caller must see the original ``Timeout`` type, not a wrapped Exception.
+
+        Lets the MCP error classifier (and other consumers) discriminate
+        by ``isinstance`` rather than parsing message strings.
+        """
+        from unittest.mock import patch
+
+        from curl_cffi.requests.exceptions import Timeout
+
+        from fli.search.client import Client
+
+        c = Client()
+        with patch.object(
+            c._client, "post", side_effect=Timeout("Operation timed out")
+        ):
+            try:
+                c.post("https://example.com")
+            except Exception as e:
+                # Concrete subclass, not generic ``Exception``.
+                assert isinstance(e, Timeout)
+                assert "timed out" in str(e).lower()

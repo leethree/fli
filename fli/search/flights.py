@@ -31,6 +31,15 @@ class SearchFlights:
     DEFAULT_HEADERS = {
         "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
     }
+    # ``search`` (the recursive entry point used by the CLI and direct
+    # Python callers) opts into a longer per-attempt timeout than
+    # ``Client.DEFAULT_TIMEOUT`` (25 s).  The 25 s default is sized for
+    # the MCP transport's request budget; CLI users routinely tolerate
+    # 30-60 s for complex multi-city expansions and the live-API tests
+    # in particular need headroom for network jitter on JFK/LAX-class
+    # routes.  The MCP path uses ``_do_single_search`` directly and
+    # keeps the tight default.
+    SEARCH_REQUEST_TIMEOUT = 60
 
     def __init__(self):
         """Initialize the search client for flight searches."""
@@ -152,9 +161,10 @@ class SearchFlights:
                 data=f"f.req={encoded_filters}",
                 impersonate="chrome",
                 allow_redirects=True,
+                timeout=self.SEARCH_REQUEST_TIMEOUT,
             )
             # No raise_for_status() here: ``Client.post`` already calls it
-            # internally and re-wraps any non-2xx as an Exception.
+            # internally.
 
             parsed = json.loads(response.text.lstrip(")]}'"))[0][2]
             if not parsed:
