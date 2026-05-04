@@ -498,7 +498,9 @@ class TestStickyDegradedState:
             assert "Continuing in per-leg pricing mode" in step2["message"]
 
     def test_degraded_flag_persists_across_empty_intermediate_step(self):
-        """If a continuation step's fallback also turns up empty, the session
+        """Keep the degraded flag set when a continuation step's fallback is empty.
+
+        If a continuation step's fallback also turns up empty, the session
         must keep the degraded flag so the *next* retry still skips the
         multi-city call.
         """
@@ -717,16 +719,20 @@ class TestNegativeSelection:
 
 
 class TestSessionKeyIncludesFilters:
-    """Reformulating filter params must miss the cache, not silently re-use
-    a session computed under different filters."""
+    """Cache key must include filter params so reformulated calls miss the cache.
+
+    Without folding the filters in, a continuation call that changed
+    cabin_class / sort_by / etc. would silently reuse the original
+    session and return results computed under the previous filters.
+    """
 
     def _params(self, **overrides):
-        base = dict(
-            legs=[
+        base = {
+            "legs": [
                 MultiCityLeg(origin="JFK", destination="LHR", date="2027-06-01"),
                 MultiCityLeg(origin="LHR", destination="CDG", date="2027-06-05"),
             ],
-        )
+        }
         base.update(overrides)
         return MultiCitySearchParams(**base)
 
@@ -925,8 +931,11 @@ class TestJsonStringListCoercion:
         assert p.airlines is None
 
     def test_malformed_json_string_still_rejected_for_airlines(self) -> None:
-        """A malformed JSON-list-like string falls through to Pydantic, which
-        then rejects it as not-a-list rather than swallowing the bad input."""
+        """Malformed JSON-list-like strings are not coerced.
+
+        They fall through to Pydantic, which then rejects them as
+        not-a-list rather than swallowing the bad input.
+        """
         from pydantic import ValidationError
 
         with pytest.raises(ValidationError):
@@ -938,8 +947,11 @@ class TestJsonStringListCoercion:
             )
 
     def test_non_list_json_not_coerced(self) -> None:
-        """Strings that parse as non-list JSON (object, number) flow
-        through to the type validator unchanged."""
+        """Non-list JSON strings are not coerced.
+
+        Strings that parse as non-list JSON (object, number) flow
+        through to the type validator unchanged.
+        """
         # ``'{"x": 1}'`` parses but isn't a list, so the coercer returns
         # the original string and Pydantic decides what to do.
         from pydantic import ValidationError

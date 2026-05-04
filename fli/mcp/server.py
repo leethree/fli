@@ -180,9 +180,9 @@ class FlightSearchParams(BaseModel):
     # model so the same fix covers ``airlines`` (Issue C in the
     # BUGREPORT) and the ``origin`` / ``destination`` union types (same
     # transport bug, just hadn't been hit yet).
-    _coerce_lists = field_validator(
-        "origin", "destination", "airlines", mode="before"
-    )(_coerce_json_list_string)
+    _coerce_lists = field_validator("origin", "destination", "airlines", mode="before")(
+        _coerce_json_list_string
+    )
 
 
 class MultiCityLeg(BaseModel):
@@ -240,9 +240,7 @@ class MultiCitySearchParams(BaseModel):
 
     # ``legs`` is also list-shaped and shows the same transport-encoding
     # symptom — covered here so the same fix protects both.
-    _coerce_lists = field_validator("legs", "airlines", mode="before")(
-        _coerce_json_list_string
-    )
+    _coerce_lists = field_validator("legs", "airlines", mode="before")(_coerce_json_list_string)
 
 
 class DateSearchParams(BaseModel):
@@ -276,9 +274,9 @@ class DateSearchParams(BaseModel):
         description="Number of adult passengers",
     )
 
-    _coerce_lists = field_validator(
-        "origin", "destination", "airlines", mode="before"
-    )(_coerce_json_list_string)
+    _coerce_lists = field_validator("origin", "destination", "airlines", mode="before")(
+        _coerce_json_list_string
+    )
 
 
 # =============================================================================
@@ -334,7 +332,8 @@ def _serialize_flight_result(flight: Any, is_round_trip: bool = False) -> dict[s
 
 
 def _normalize_flight_prices(
-    flight_results: list[dict[str, Any]], sort_by: Any = None,
+    flight_results: list[dict[str, Any]],
+    sort_by: Any = None,
 ) -> list[dict[str, Any]]:
     """Tag price-unavailable entries and ensure they don't pollute CHEAPEST sort.
 
@@ -383,9 +382,9 @@ def _serialize_date_result(date_result: Any) -> dict[str, Any]:
 
 
 def _classify_search_error(exc: Exception) -> dict[str, Any]:
-    """Classify a search exception so callers can distinguish a true zero-result
-    response from a network/API failure.
+    """Classify a search exception so callers can distinguish failure modes.
 
+    Distinguishes a true zero-result response from a network/API failure.
     Without this, a 30-60s timeout against Google Flights and a search that
     legitimately returns zero options both surface to the LLM as
     ``flights:[]``, which is easy to misread as "the requested itinerary is
@@ -653,7 +652,8 @@ def _session_cache_key(params: MultiCitySearchParams) -> str:
 
 
 def _build_per_leg_fallback_filters(
-    filters: FlightSearchFilters, current_step: int,
+    filters: FlightSearchFilters,
+    current_step: int,
 ) -> FlightSearchFilters:
     """Build a one-way filter for a single leg of a multi-city itinerary.
 
@@ -748,9 +748,7 @@ def _execute_multi_city_step(
             # — the third element is set by an earlier step that fell back to
             # per-leg pricing because Google's multi-city curator was broken.
             filters, last_results, degraded = cached
-            current_step = sum(
-                1 for s in filters.flight_segments if s.selected_flight is not None
-            )
+            current_step = sum(1 for s in filters.flight_segments if s.selected_flight is not None)
 
             if selection < 0 or selection >= len(last_results):
                 return {
@@ -806,7 +804,8 @@ def _execute_multi_city_step(
         if not raw or _all_unpriced(raw):
             fallback_filters = _build_per_leg_fallback_filters(filters, current_step)
             fb_result = search_client._do_single_search(
-                fallback_filters, include_metadata=True,
+                fallback_filters,
+                include_metadata=True,
             )
             if fb_result is not None:
                 fb_raw, _ = fb_result
@@ -858,7 +857,8 @@ def _execute_multi_city_step(
 
         flight_results = [_serialize_flight_result(f, is_round_trip=False) for f in raw]
         flight_results = _normalize_flight_prices(
-            flight_results, sort_by=filters.sort_by,
+            flight_results,
+            sort_by=filters.sort_by,
         )
 
         # ``degraded`` is sticky across the whole session: once any leg
@@ -921,7 +921,7 @@ def _execute_multi_city_step(
                 f"{lead_in} the combined trip total won't be available, so"
                 " sum the individual leg prices to estimate the trip cost."
                 + (
-                    f" Pick a flight by index (0-{len(flight_results)-1})"
+                    f" Pick a flight by index (0-{len(flight_results) - 1})"
                     " and call again with selection=<index>."
                     if not is_final
                     else ""

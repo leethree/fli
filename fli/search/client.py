@@ -13,6 +13,8 @@ from typing import Any
 from curl_cffi import requests
 from curl_cffi.requests.exceptions import (
     ConnectionError as CurlConnectionError,
+)
+from curl_cffi.requests.exceptions import (
     HTTPError,
     Timeout,
 )
@@ -43,7 +45,7 @@ def _is_retriable_request_failure(exc: BaseException) -> bool:
       * Other 4xx (auth, bad request, not found — won't change).
       * Anything that isn't an HTTP/network error.
     """
-    if isinstance(exc, (Timeout, CurlConnectionError)):
+    if isinstance(exc, Timeout | CurlConnectionError):
         return True
     if isinstance(exc, HTTPError):
         # ``raise_for_status`` attaches the response; older variants may
@@ -55,6 +57,7 @@ def _is_retriable_request_failure(exc: BaseException) -> bool:
             return True
         return status >= 500 or status == 429
     return False
+
 
 client = None
 

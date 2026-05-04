@@ -1,6 +1,7 @@
 """Tests for Search class."""
 
 from datetime import datetime, timedelta
+from unittest.mock import MagicMock
 
 import pytest
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -324,7 +325,7 @@ class TestEmptyBodyRetry:
         )
 
     @staticmethod
-    def _make_response(text: str) -> "MagicMock":
+    def _make_response(text: str) -> MagicMock:
         """Create a minimal response-shaped mock with a configurable body.
 
         Args:
@@ -414,10 +415,7 @@ class TestEmptyBodyRetry:
         # where indices 2 and 3 are ``None`` so the ``isinstance(...,
         # list)`` filter in ``_do_single_search`` skips them and we get
         # an empty flights list rather than an IndexError.
-        warm_payload = (
-            ")]}'\n"
-            + '[[null, null, "[null, null, null, null]"]]'
-        )
+        warm_payload = ")]}'\n" + '[[null, null, "[null, null, null, null]"]]'
         sf = SearchFlights()
         responses = [self._make_response(""), self._make_response(warm_payload)]
         with (
@@ -431,10 +429,12 @@ class TestEmptyBodyRetry:
 
 
 class TestRecursionTimeoutPolicy:
-    """``SearchFlights.search``'s per-iteration timeout handling must
-    distinguish 'every continuation timed out' (real API failure, raise)
-    from 'one branch timed out, others legitimately had no flights'
-    (real zero-result, return empty).
+    """Per-iteration timeout policy in ``SearchFlights.search``.
+
+    The recursive multi-leg search must distinguish 'every continuation
+    timed out' (real API failure, raise) from 'one branch timed out,
+    others legitimately had no flights' (real zero-result, return
+    empty).
 
     Regression test for the CodeRabbit review on leethree/fli#2 — the
     previous condition ``timeout_skipped > 0 and not flight_combos``
@@ -471,7 +471,7 @@ class TestRecursionTimeoutPolicy:
         )
 
     @staticmethod
-    def _flight_with_legs(price: float = 100.0) -> "MagicMock":
+    def _flight_with_legs(price: float = 100.0) -> MagicMock:
         """Build a minimal ``FlightResult``-shaped mock the recursion can deepcopy.
 
         ``SearchFlights.search`` calls ``deepcopy(filters)`` on each
@@ -591,9 +591,7 @@ class TestRetryPredicate:
         http_err.response = resp_404
 
         c = Client()
-        with patch.object(
-            c._client, "post", side_effect=http_err
-        ) as mock_post:
+        with patch.object(c._client, "post", side_effect=http_err) as mock_post:
             with pytest.raises(HTTPError):
                 c.post("https://example.com")
 
@@ -614,9 +612,7 @@ class TestRetryPredicate:
         http_err.response = resp_503
 
         c = Client()
-        with patch.object(
-            c._client, "post", side_effect=http_err
-        ) as mock_post:
+        with patch.object(c._client, "post", side_effect=http_err) as mock_post:
             with pytest.raises(HTTPError):
                 c.post("https://example.com")
 
@@ -637,9 +633,7 @@ class TestRetryPredicate:
         http_err.response = resp_429
 
         c = Client()
-        with patch.object(
-            c._client, "post", side_effect=http_err
-        ) as mock_post:
+        with patch.object(c._client, "post", side_effect=http_err) as mock_post:
             with pytest.raises(HTTPError):
                 c.post("https://example.com")
 
@@ -669,9 +663,7 @@ class TestRetryPredicate:
         from fli.search.client import Client
 
         c = Client()
-        with patch.object(
-            c._client, "post", side_effect=ValueError("bad arg")
-        ) as mock_post:
+        with patch.object(c._client, "post", side_effect=ValueError("bad arg")) as mock_post:
             with pytest.raises(ValueError):
                 c.post("https://example.com")
 
@@ -691,9 +683,7 @@ class TestRetryPredicate:
         from fli.search.client import Client
 
         c = Client()
-        with patch.object(
-            c._client, "post", side_effect=Timeout("Operation timed out")
-        ):
+        with patch.object(c._client, "post", side_effect=Timeout("Operation timed out")):
             try:
                 c.post("https://example.com")
             except Exception as e:
