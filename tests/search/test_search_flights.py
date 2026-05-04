@@ -1,9 +1,11 @@
 """Tests for Search class."""
 
+import json
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
+from curl_cffi.requests.exceptions import Timeout
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from fli.models import (
@@ -485,83 +487,130 @@ class TestRecursionTimeoutPolicy:
             the recursion's purposes.
 
         """
-        from unittest.mock import MagicMock
-
         f = MagicMock()
         f.price = price
         return f
 
+    @staticmethod
+    def _canned_post_response(num_flights: int) -> MagicMock:
+        """Build a minimal HTTP response that ``search`` can parse.
+
+        ``SearchFlights.search`` calls ``self.client.post`` directly and
+        then parses ``response.text`` as a JSON envelope whose
+        ``[0][2]`` is itself a JSON-encoded list with ``[2]`` being a
+        list of flight items.  We stub the per-item parser
+        (``_parse_flights_data``) so the *contents* of those items
+        don't matter — they just need to exist as the right number of
+        list elements.
+
+        Args:
+            num_flights: How many entries to put under
+                ``decoded[2][0]`` so the outer search produces that
+                many leg-1 options for the recursion to fan out over.
+
+        Returns:
+            A ``MagicMock`` with ``.text`` set to a parseable envelope.
+
+        """
+        inner_decoded = [None, None, [[f"item-{i}" for i in range(num_flights)]], None]
+        outer_envelope = [[None, None, json.dumps(inner_decoded)]]
+        text = ")]}'\n" + json.dumps(outer_envelope)
+        resp = MagicMock()
+        resp.text = text
+        return resp
+
+    def _drive_recursion(
+        self, *, num_continuations: int, continuation_outcomes: list,
+    ):
+        """Drive ``SearchFlights.search`` end-to-end without any live HTTP.
+
+        Args:
+            num_continuations: How many leg-1 options to seed (the
+                recursion fans out one continuation per option).
+            continuation_outcomes: One per continuation, in order.  Each
+                may be the literal exception ``Timeout(...)`` (raise it),
+                ``None`` (legitimate "no onward flights"), or a list
+                (return that as the next-leg result).
+
+        Returns:
+            Whatever ``sf.search`` returns or raises (the test asserts
+            on the result/exception).
+
+        """
+        sf = SearchFlights()
+        leg1_mocks = [self._flight_with_legs(p) for p in range(num_continuations)]
+        outcome_iter = iter(continuation_outcomes)
+
+        def fake_recursive(self_, filters, top_n=5):
+            # Outer call: no selected_flight on any segment → return
+            # ``original_search`` so the production guard logic runs.
+            if all(s.selected_flight is None for s in filters.flight_segments):
+                return original_search(self_, filters, top_n)
+            outcome = next(outcome_iter)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        original_search = SearchFlights.search
+        canned = self._canned_post_response(num_continuations)
+        # Triple patch:
+        #   * ``client.post`` short-circuits the real HTTP request.
+        #   * ``_parse_flights_data`` short-circuits the per-item parse
+        #     so we don't have to construct a Google-shaped flight blob.
+        #   * ``SearchFlights.search`` redirects recursive (continuation)
+        #     calls into ``fake_recursive`` while the outer call still
+        #     runs the real method.
+        with (
+            patch.object(sf.client, "post", return_value=canned),
+            patch.object(
+                SearchFlights,
+                "_parse_flights_data",
+                staticmethod(lambda data: leg1_mocks.pop(0)),
+            ),
+            patch.object(SearchFlights, "search", autospec=True, side_effect=fake_recursive),
+        ):
+            return sf.search(self._round_trip_filters(), top_n=num_continuations)
+
     def test_mixed_timeout_and_empty_returns_empty_not_raise(self) -> None:
-        """A mix of one timeout and several empty continuations must return ``[]``.
+        """A mix of one timeout and two legitimate empties must return ``[]``.
 
         Without this distinction, the previous code raised on any
         ``timeout_skipped > 0 and not flight_combos`` outcome — which
         wrongly told MCP callers to retry queries that had already
         exhaustively answered "no onward flights on those branches".
         """
-        from unittest.mock import patch
-
-        sf = SearchFlights()
-        leg1_options = [self._flight_with_legs(p) for p in (100.0, 200.0, 300.0)]
-        timeout_exc = Exception("Timeout: Operation timed out")
-
-        # ``search`` recurses into itself; mock the recursive call so the
-        # outer entry is the real method (so we exercise the real
-        # post-loop ``raise_condition`` from production code).  The
-        # recursive calls get a fake that emits one timeout, two empties.
-        original_search = SearchFlights.search
-
-        recursive_call_count = {"n": 0}
-
-        def fake_recursive(self_, filters, top_n=5):
-            # The outer call sees no selected_flight; let it through to
-            # the real implementation.
-            if all(s.selected_flight is None for s in filters.flight_segments):
-                # Bypass the real network call by feeding leg-1 results
-                # directly via ``_do_single_search`` patch (below).
-                return original_search(self_, filters, top_n)
-            # Recursive (continuation) call: deterministic outcome.
-            i = recursive_call_count["n"]
-            recursive_call_count["n"] += 1
-            if i == 0:
-                raise timeout_exc
-            return None  # legitimate "no onward flights"
-
-        with patch.object(SearchFlights, "search", autospec=True, side_effect=fake_recursive):
-            with patch.object(sf, "_do_single_search", return_value=leg1_options):
-                result = sf.search(self._round_trip_filters(), top_n=3)
-
+        result = self._drive_recursion(
+            num_continuations=3,
+            continuation_outcomes=[
+                Timeout("Operation timed out"),  # raises
+                None,  # legitimate "no onward flights"
+                None,
+            ],
+        )
         # 3 continuations attempted, 1 timed out, 2 empties → flight_combos
-        # is empty but the trip is real "no flights", so we return [] cleanly.
+        # is empty but the trip is a real "no flights" outcome, so we
+        # return ``[]`` cleanly.  No raise.
         assert result == []
-        assert recursive_call_count["n"] == 3
 
     def test_all_continuations_timeout_does_raise(self) -> None:
         """When *every* continuation times out, surface the timeout.
 
-        The outer call must raise so the MCP layer can report a transient
-        backend stall rather than a misleading "no flights" result.
+        The outer call must raise ``Timeout`` so the MCP layer can
+        report a transient backend stall rather than a misleading
+        "no flights" result.
         """
-        from unittest.mock import patch
-
-        sf = SearchFlights()
-        leg1_options = [self._flight_with_legs(p) for p in (100.0, 200.0, 300.0)]
-        timeout_exc = Exception("Timeout: Operation timed out")
-
-        original_search = SearchFlights.search
-
-        def fake_recursive(self_, filters, top_n=5):
-            if all(s.selected_flight is None for s in filters.flight_segments):
-                return original_search(self_, filters, top_n)
-            raise timeout_exc
-
-        with patch.object(SearchFlights, "search", autospec=True, side_effect=fake_recursive):
-            with patch.object(sf, "_do_single_search", return_value=leg1_options):
-                with pytest.raises(Exception) as exc_info:
-                    sf.search(self._round_trip_filters(), top_n=3)
-
-        # The outer ``except Exception`` wrapper rebrands the message,
-        # but the underlying "All N timed out" text must survive.
+        with pytest.raises(Timeout) as exc_info:
+            self._drive_recursion(
+                num_continuations=3,
+                continuation_outcomes=[
+                    Timeout("Operation timed out"),
+                    Timeout("Operation timed out"),
+                    Timeout("Operation timed out"),
+                ],
+            )
+        # Concrete ``Timeout`` type so the MCP classifier (and any
+        # other consumer) can branch via ``isinstance`` instead of
+        # parsing the message — this also pins the type contract.
         assert "timed out" in str(exc_info.value).lower()
 
 

@@ -8,6 +8,8 @@ import json
 from copy import deepcopy
 from datetime import datetime
 
+from curl_cffi.requests.exceptions import Timeout
+
 from fli.core import extract_currency_from_price_token
 from fli.models import (
     Airline,
@@ -203,7 +205,11 @@ class SearchFlights:
             # zero combos instead of the 4 that actually completed.  Treat
             # timeouts as "this branch is unavailable right now" and keep
             # whatever combos succeeded.  Non-timeout errors still bubble
-            # up so real bugs aren't swallowed.
+            # up so real bugs aren't swallowed.  Detection is by the
+            # concrete ``curl_cffi.Timeout`` type (and our own Timeout
+            # raised below for "all branches timed out") rather than
+            # string-matching on the exception message — string matching
+            # was fragile and depended on the now-removed outer wrapper.
             flight_combos = []
             timeout_skipped = 0
             total_continuations = 0
@@ -213,12 +219,9 @@ class SearchFlights:
                 next_filters.flight_segments[selected_count].selected_flight = selected_flight
                 try:
                     next_results = self.search(next_filters, top_n=top_n)
-                except Exception as inner:
-                    msg = str(inner).lower()
-                    if "timed out" in msg or "curl: (28)" in msg:
-                        timeout_skipped += 1
-                        continue
-                    raise
+                except Timeout:
+                    timeout_skipped += 1
+                    continue
                 if next_results is not None:
                     for next_result in next_results:
                         if isinstance(next_result, tuple):
@@ -233,20 +236,31 @@ class SearchFlights:
             # result, not an API failure, and reporting it as a timeout
             # would mislead the MCP layer into telling the agent to retry
             # a query that's already shown its answer.
+            #
+            # Raise ``Timeout`` (the same type ``Client.post`` raises on
+            # a hung request) so an enclosing recursion frame and the
+            # MCP error classifier can both isinstance-check rather than
+            # parse the message.
             if (
                 total_continuations > 0
                 and timeout_skipped == total_continuations
                 and not flight_combos
             ):
-                raise Exception(
+                raise Timeout(
                     f"All {timeout_skipped} multi-city continuation calls"
                     " timed out on the Google Flights API. Retry the search."
                 )
 
             return flight_combos
 
-        except Exception as e:
-            raise Exception(f"Search failed: {str(e)}") from e
+        # No outer wrapper: let the original exception type propagate so
+        # callers (notably the MCP error classifier) can branch on
+        # concrete types via ``isinstance`` instead of parsing the
+        # message.  The raise sites above (``Client.post`` for HTTP
+        # errors, ``Timeout`` for the all-branches-timed-out path) are
+        # already informative on their own.
+        except Exception:
+            raise
 
     @staticmethod
     def _parse_flights_data(data: list) -> FlightResult:
