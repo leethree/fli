@@ -12,7 +12,7 @@ from typing import Any
 
 from curl_cffi import requests
 from ratelimit import limits, sleep_and_retry
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, stop_after_delay, wait_exponential
 
 client = None
 
@@ -23,12 +23,23 @@ class Client:
     DEFAULT_HEADERS = {
         "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
     }
-    # Multi-city continuation calls (where ``selected_flight`` is set on
-    # previous segments) routinely take longer than ``curl_cffi``'s default
-    # 30 seconds when Google Flights composites discontinuous itineraries.
-    # 60s leaves enough headroom without making genuinely dead requests
-    # block forever.
-    DEFAULT_TIMEOUT = 60
+    # Per-attempt HTTP timeout.  Sized to fit *one* ``Client.post`` call
+    # within typical MCP transport budgets (~30 s client-side request
+    # timeout in Claude Desktop and similar).  Google's
+    # ``GetShoppingResults`` either responds quickly (< 5 s warm) or
+    # hangs until its own ~60 s server-side timeout — the latter is a
+    # transient backend stall, so capping our wait short and surfacing
+    # the empty/timeout outcome lets the calling agent retry on a fresh
+    # MCP-level budget instead of having one long call eaten by the
+    # transport.
+    DEFAULT_TIMEOUT = 25
+    # Total wall-time cap on the tenacity retry loop, in seconds.  Just
+    # under typical MCP client request timeouts (~30 s) so a hung
+    # request followed by tenacity retries can't accumulate past the
+    # transport budget.  ``stop_after_delay`` is checked between
+    # attempts; combined with ``DEFAULT_TIMEOUT`` it bounds the worst
+    # case to a single full-timeout attempt rather than three.
+    RETRY_TOTAL_DELAY = 24
 
     def __init__(self):
         """Initialize a new client session with default headers."""
@@ -42,7 +53,16 @@ class Client:
 
     @sleep_and_retry
     @limits(calls=10, period=1)
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(), reraise=True)
+    @retry(
+        # Stop on either condition: 3 attempts max, OR total wall time
+        # past the MCP-friendly budget.  The delay cap prevents a single
+        # hung request from spawning two more 25 s waits on retry —
+        # which is the failure mode that pushed worst-case wall to 78 s
+        # and ate the MCP transport budget.
+        stop=(stop_after_attempt(3) | stop_after_delay(RETRY_TOTAL_DELAY)),
+        wait=wait_exponential(multiplier=0.1, max=1),
+        reraise=True,
+    )
     def get(self, url: str, **kwargs: Any) -> requests.Response:
         """Make a rate-limited GET request with automatic retries.
 
@@ -67,7 +87,16 @@ class Client:
 
     @sleep_and_retry
     @limits(calls=10, period=1)
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(), reraise=True)
+    @retry(
+        # Stop on either condition: 3 attempts max, OR total wall time
+        # past the MCP-friendly budget.  The delay cap prevents a single
+        # hung request from spawning two more 25 s waits on retry —
+        # which is the failure mode that pushed worst-case wall to 78 s
+        # and ate the MCP transport budget.
+        stop=(stop_after_attempt(3) | stop_after_delay(RETRY_TOTAL_DELAY)),
+        wait=wait_exponential(multiplier=0.1, max=1),
+        reraise=True,
+    )
     def post(self, url: str, **kwargs: Any) -> requests.Response:
         """Make a rate-limited POST request with automatic retries.
 

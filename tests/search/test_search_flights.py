@@ -344,9 +344,12 @@ class TestEmptyBodyRetry:
     def test_truly_empty_body_does_not_raise_on_multi_leg(self) -> None:
         """An HTTP 200 with an empty body must not raise ``JSONDecodeError``.
 
-        The multi-leg retry path must fire on the empty body and, if the
-        retry also returns empty, the call must return ``None`` cleanly
-        instead of propagating a parser exception.
+        The empty-body guard returns ``None`` cleanly instead of
+        propagating a parser exception.  Application-layer retry is
+        disabled by default to fit MCP transport budgets — see the
+        ``_EMPTY_RETRIES_MULTI_LEG`` constant; the MCP layer's
+        retry-with-hint pattern handles cold-cache transients better
+        because each retry gets a fresh transport budget.
         """
         from unittest.mock import patch
 
@@ -356,9 +359,8 @@ class TestEmptyBodyRetry:
             result = sf._do_single_search(self._multi_leg_filters())
 
         assert result is None
-        # Multi-leg = 1 + 1 retry attempt = 2 calls total.  If the parse
-        # raised before the retry guard, we'd see 1 call and an exception.
-        assert mock_post.call_count == 2
+        # Single attempt by default; the parser must not raise on empty.
+        assert mock_post.call_count == 1
 
     def test_anti_xssi_prefix_only_body_does_not_raise(self) -> None:
         """A body containing only the anti-XSSI prefix is still 'empty'.
@@ -366,7 +368,7 @@ class TestEmptyBodyRetry:
         Google's frontend prefixes responses with ``)]}'`` to defeat
         cross-site script inclusion; a body that's *only* the prefix is
         no payload at all and must be treated identically to a
-        zero-length body for retry purposes.
+        zero-length body — no parser exception, ``None`` returned.
         """
         from unittest.mock import patch
 
@@ -376,14 +378,16 @@ class TestEmptyBodyRetry:
             result = sf._do_single_search(self._multi_leg_filters())
 
         assert result is None
-        assert mock_post.call_count == 2
+        assert mock_post.call_count == 1
 
     def test_one_way_does_not_retry_on_empty_body(self) -> None:
-        """One-way queries must accept an empty body without retrying.
+        """One-way queries return ``None`` cleanly on empty body — single attempt.
 
         The one-way endpoint is reliable enough that an empty response
-        is almost always a real "no flights" outcome; retrying it just
-        adds ~60 s of latency for no benefit.
+        is almost always a real "no flights" outcome; this test guards
+        the single-attempt invariant against a regression that would
+        wake retry on one-way (e.g. a future change to the
+        ``is_multi_leg`` check).
         """
         from unittest.mock import patch
 
@@ -395,12 +399,13 @@ class TestEmptyBodyRetry:
         assert result is None
         assert mock_post.call_count == 1
 
-    def test_retry_recovers_when_second_attempt_returns_data(self) -> None:
-        """A successful retry after an empty first attempt must return the parsed flights.
+    def test_explicit_retry_override_enables_recovery(self) -> None:
+        """Callers outside MCP (e.g. the CLI) can opt back into retry.
 
-        Proves the retry path isn't decorative: if the second attempt
-        returns a parseable envelope, the call yields the parsed result
-        rather than bailing on the first empty.
+        The ``_EMPTY_RETRIES_MULTI_LEG`` constant is exposed so a
+        caller with a more relaxed wall-time budget can enable empty-
+        body retries.  This test pins the recovery semantics so a
+        future refactor doesn't silently break that escape hatch.
         """
         from unittest.mock import patch
 
@@ -415,11 +420,12 @@ class TestEmptyBodyRetry:
         )
         sf = SearchFlights()
         responses = [self._make_response(""), self._make_response(warm_payload)]
-        with patch.object(sf.client, "post", side_effect=responses) as mock_post:
+        with (
+            patch.object(SearchFlights, "_EMPTY_RETRIES_MULTI_LEG", 1),
+            patch.object(sf.client, "post", side_effect=responses) as mock_post,
+        ):
             result = sf._do_single_search(self._multi_leg_filters())
 
-        # Empty inner list slots → zero flights, but non-None means we
-        # actually parsed the warm response and didn't bail early.
         assert result == []
         assert mock_post.call_count == 2
 

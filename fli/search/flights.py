@@ -36,13 +36,17 @@ class SearchFlights:
         """Initialize the search client for flight searches."""
         self.client = get_client()
 
-    # For multi-leg queries Google's GetShoppingResults backend frequently
-    # returns an HTTP 200 with an empty body on cold queries (server-side
-    # ~60s timeout).  Retrying the same request often succeeds because the
-    # session warms up — see the variance characterisation in the commit
-    # that introduced this constant.  One extra attempt covers ~50% of
-    # cold-path failures without pushing wall time past ~2 minutes.
-    _EMPTY_RETRIES_MULTI_LEG = 1
+    # Application-layer retry-on-empty for multi-leg queries.  Was 1
+    # (one extra attempt) but disabled because the doubled wall-time it
+    # produced on cold-cache empties (~2× ``Client.DEFAULT_TIMEOUT``)
+    # routinely exceeded MCP client transport budgets.  The MCP layer
+    # surfaces an explicit "empty likely transient — retry the same
+    # call" hint instead, which gives each retry a fresh transport
+    # budget; that's strictly better than soaking the budget on a
+    # single attempt's retry loop.  Kept as a constant so a caller
+    # outside MCP (e.g. the CLI, where the budget is the user's
+    # patience) can override it.
+    _EMPTY_RETRIES_MULTI_LEG = 0
 
     def _do_single_search(
         self, filters: FlightSearchFilters, *, include_metadata: bool = False
